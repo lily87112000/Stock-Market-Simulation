@@ -1,4 +1,5 @@
 import express from 'express';
+import http from 'http';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -29,9 +30,15 @@ process.on('uncaughtException', (err) => {
 });
 
 async function startServer() {
+  const httpServer = http.createServer(app);
+  let vite: Awaited<ReturnType<typeof createViteServer>> | null = null;
+
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
+    vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR !== 'true' ? { server: httpServer } : false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -42,21 +49,32 @@ async function startServer() {
     });
   }
 
-  const server = app.listen(PORT, HOST, () => {
-    console.log(`Server listening on ${HOST}:${PORT}`);
-  });
-
-  server.on('error', (err: any) => {
+  httpServer.on('error', (err: any) => {
     if (err.code === 'EADDRINUSE') {
-      console.error(`Port ${PORT} is already in use. Retrying or shutting down...`);
+      console.error(`Port ${PORT} is already in use.`);
+      process.exit(1);
     } else {
       console.error('Server listen error:', err);
     }
   });
+
+  httpServer.listen(PORT, HOST, () => {
+    console.log(`Server listening on ${HOST}:${PORT}`);
+  });
+
+  const shutdown = async () => {
+    try {
+      if (vite) await vite.close();
+    } catch (_) {}
+    httpServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1500).unref();
+  };
+
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
 
 startServer().catch(err => {
   console.error('Server startup failed:', err);
   process.exit(1);
 });
-

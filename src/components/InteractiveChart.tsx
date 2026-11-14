@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { CandleData, TradeRecord, StockQuote } from '../types/stock.ts';
+import { CandleData, TradeRecord, StockQuote, StockStrategySignal } from '../types/stock.ts';
 import { Maximize2, Minimize2, Crosshair, AlertTriangle, Star, RefreshCw, TrendingUp, TrendingDown, Sparkles } from 'lucide-react';
 import { InstitutionalTradesPanel } from './InstitutionalTradesPanel.tsx';
 
@@ -8,6 +8,7 @@ interface InteractiveChartProps {
   symbol: string;
   stockName: string;
   trades?: TradeRecord[];
+  strategySignal?: StockStrategySignal;
   isLoading?: boolean;
   selectedRange?: string;
   onRangeChange?: (range: string) => void;
@@ -27,6 +28,7 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
   symbol,
   stockName,
   trades = [],
+  strategySignal,
   isLoading = false,
   selectedRange = '2y',
   onRangeChange,
@@ -52,13 +54,22 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
   const [showTradeMarkers, setShowTradeMarkers] = useState<boolean>(true);
   const [showIndicatorsDetail, setShowIndicatorsDetail] = useState<boolean>(false);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [isCrosshairLocked, setIsCrosshairLocked] = useState<boolean>(false);
+  const isCrosshairLockedRef = useRef<boolean>(false);
+  const [longPressRing, setLongPressRing] = useState<{ x: number; y: number; progress: number; exiting: boolean } | null>(null);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [dimensions, setDimensions] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
 
-  // Reset zoom & pan when symbol changes to ensure newly searched stock is centered immediately
+  useEffect(() => {
+    isCrosshairLockedRef.current = isCrosshairLocked;
+  }, [isCrosshairLocked]);
+
+  // Reset zoom, pan & crosshair lock when symbol changes to ensure newly searched stock is centered immediately
   useEffect(() => {
     setOffsetRight(0);
     setHoverIndex(null);
+    setIsCrosshairLocked(false);
+    isCrosshairLockedRef.current = false;
   }, [symbol]);
 
   // Responsive resize tracking - monitors container visibility, tab switching & symbol transitions
@@ -137,13 +148,6 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
     return visibleData.length > 0 ? visibleData[visibleData.length - 1] : null;
   }, [hoverIndex, visibleData]);
 
-  // Check if active hover candle matches any trade entry or exit
-  const hoverTradeInfo = useMemo(() => {
-    if (!activeHoverCandle || !trades || trades.length === 0) return null;
-    const entryTrade = trades.find(t => t.entryDate === activeHoverCandle.time);
-    const exitTrade = trades.find(t => Boolean(t.exitDate) && t.exitDate === activeHoverCandle.time);
-    return { entryTrade, exitTrade };
-  }, [activeHoverCandle, trades]);
 
   // Canvas drawing: All-in-one unified view (Price + Volume + KD + MACD + Strategy Trade Markers)
   useEffect(() => {
@@ -373,117 +377,181 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
     }
 
     // -------------------------------------------------------------
-    // STRATEGY TRADE MARKERS (進場 ▲ / 出場 ▼ / 停損 ▼)
+    // STRATEGY TRADE MARKERS (進場 ▲ / 出場 ▼ / 停損 ▼) & LIVE STRATEGY SIGNAL
     // -------------------------------------------------------------
-    if (showTradeMarkers && trades && trades.length > 0) {
+    if (showTradeMarkers) {
       const timeToVisibleIndex = new Map<string, number>();
       visibleData.forEach((c, idx) => {
         timeToVisibleIndex.set(c.time, idx);
       });
 
-      trades.forEach(trade => {
-        const entryIdx = timeToVisibleIndex.get(trade.entryDate);
-        const exitIdx = trade.exitDate ? timeToVisibleIndex.get(trade.exitDate) : undefined;
+      const entryDrawnIndices = new Set<number>();
 
-        // 1. Draw dashed connecting line between entry & exit if both are visible
-        if (entryIdx !== undefined && exitIdx !== undefined) {
-          const x1 = entryIdx * step + step / 2;
-          const y1 = getY(trade.entryPrice);
-          const x2 = exitIdx * step + step / 2;
-          const y2 = getY(trade.exitPrice);
+      if (trades && trades.length > 0) {
+        trades.forEach(trade => {
+          const entryIdx = timeToVisibleIndex.get(trade.entryDate);
+          const exitIdx = trade.exitDate ? timeToVisibleIndex.get(trade.exitDate) : undefined;
 
-          ctx.save();
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.lineWidth = 1.2;
-          ctx.setLineDash([3, 3]);
-          ctx.strokeStyle = trade.isWin ? 'rgba(34, 197, 94, 0.65)' : 'rgba(239, 68, 68, 0.65)';
-          ctx.stroke();
-          ctx.restore();
+          // 1. Draw dashed connecting line between entry & exit if both are visible
+          if (entryIdx !== undefined && exitIdx !== undefined) {
+            const x1 = entryIdx * step + step / 2;
+            const y1 = getY(trade.entryPrice);
+            const x2 = exitIdx * step + step / 2;
+            const y2 = getY(trade.exitPrice);
+
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.lineWidth = 1.2;
+            ctx.setLineDash([3, 3]);
+            ctx.strokeStyle = trade.isWin ? 'rgba(34, 197, 94, 0.65)' : 'rgba(239, 68, 68, 0.65)';
+            ctx.stroke();
+            ctx.restore();
+          }
+
+          // 2. Entry Marker: ▲ 買進 (Placed below the candle)
+          if (entryIdx !== undefined) {
+            entryDrawnIndices.add(entryIdx);
+            const c = visibleData[entryIdx];
+            const x = entryIdx * step + step / 2;
+            const yAnchor = Math.min(priceBottom - 8, getY(c.low) + 8);
+
+            ctx.save();
+            // Upward Triangle Arrow
+            ctx.fillStyle = '#ef4444';
+            ctx.beginPath();
+            ctx.moveTo(x, yAnchor);
+            ctx.lineTo(x - 4, yAnchor + 6);
+            ctx.lineTo(x + 4, yAnchor + 6);
+            ctx.closePath();
+            ctx.fill();
+
+            // Pill text label: 買 $xxx
+            const label = `買 $${trade.entryPrice}`;
+            ctx.font = 'bold 8.5px sans-serif';
+            const textWidth = ctx.measureText(label).width;
+            const pillW = textWidth + 8;
+            const pillH = 13;
+            const pillX = Math.max(2, Math.min(chartRight - pillW, x - pillW / 2));
+            const pillY = yAnchor + 7;
+
+            ctx.fillStyle = '#b91c1c';
+            ctx.fillRect(pillX, pillY, pillW, pillH);
+            ctx.strokeStyle = '#f87171';
+            ctx.lineWidth = 0.8;
+            ctx.strokeRect(pillX, pillY, pillW, pillH);
+
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.fillText(label, pillX + pillW / 2, pillY + 10);
+            ctx.restore();
+          }
+
+          // 3. Exit / Stop-Loss Marker: ▼ (Placed above the candle)
+          if (exitIdx !== undefined) {
+            const c = visibleData[exitIdx];
+            const x = exitIdx * step + step / 2;
+            const yAnchor = Math.max(priceTop + 14, getY(c.high) - 8);
+
+            const isStopLoss = trade.exitReason?.includes('停損') || trade.returnPct < 0;
+            const badgeColor = isStopLoss ? '#be123c' : '#047857';
+            const strokeColor = isStopLoss ? '#fb7185' : '#34d399';
+            const arrowColor = isStopLoss ? '#f43f5e' : '#10b981';
+            const label = isStopLoss
+              ? `停損 ${trade.returnPct}%`
+              : `停利 +${trade.returnPct}%`;
+
+            ctx.save();
+            // Downward Triangle Arrow
+            ctx.fillStyle = arrowColor;
+            ctx.beginPath();
+            ctx.moveTo(x, yAnchor);
+            ctx.lineTo(x - 4, yAnchor - 6);
+            ctx.lineTo(x + 4, yAnchor - 6);
+            ctx.closePath();
+            ctx.fill();
+
+            // Pill text label: 停損 -x% 或 停利 +x%
+            ctx.font = 'bold 8.5px sans-serif';
+            const textWidth = ctx.measureText(label).width;
+            const pillW = textWidth + 8;
+            const pillH = 13;
+            const pillX = Math.max(2, Math.min(chartRight - pillW, x - pillW / 2));
+            const pillY = yAnchor - 6 - pillH;
+
+            ctx.fillStyle = badgeColor;
+            ctx.fillRect(pillX, pillY, pillW, pillH);
+            ctx.strokeStyle = strokeColor;
+            ctx.lineWidth = 0.8;
+            ctx.strokeRect(pillX, pillY, pillW, pillH);
+
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.fillText(label, pillX + pillW / 2, pillY + 10);
+            ctx.restore();
+          }
+        });
+      }
+
+      // Check current live/active StrategySignal (BUY or HOLD):
+      // When strategySignal shows 'BUY' or 'HOLD', ensure that candle displays ▲ 買進
+      if (strategySignal && (strategySignal.status === 'BUY' || strategySignal.status === 'HOLD')) {
+        let targetIdx: number | undefined;
+        if (strategySignal.entryDate) {
+          targetIdx = timeToVisibleIndex.get(strategySignal.entryDate);
+        }
+        // If status is 'BUY' and entryDate wasn't matched in visibleData (e.g. entry is on current bar), use the latest visible candle
+        if (targetIdx === undefined && strategySignal.status === 'BUY' && visibleData.length > 0) {
+          targetIdx = visibleData.length - 1;
         }
 
-        // 2. Entry Marker: ▲ 買進 (Placed below the candle)
-        if (entryIdx !== undefined) {
-          const c = visibleData[entryIdx];
-          const x = entryIdx * step + step / 2;
+        if (targetIdx !== undefined && !entryDrawnIndices.has(targetIdx)) {
+          const c = visibleData[targetIdx];
+          const x = targetIdx * step + step / 2;
           const yAnchor = Math.min(priceBottom - 8, getY(c.low) + 8);
+          const price = strategySignal.entryPrice || c.close;
+          const isLatestBuy = strategySignal.status === 'BUY';
 
           ctx.save();
+          // Vertical trigger guide dashed line
+          ctx.beginPath();
+          ctx.setLineDash([2, 2]);
+          ctx.strokeStyle = isLatestBuy ? 'rgba(244, 63, 94, 0.7)' : 'rgba(239, 68, 68, 0.4)';
+          ctx.moveTo(x, priceTop);
+          ctx.lineTo(x, yAnchor);
+          ctx.stroke();
+
           // Upward Triangle Arrow
-          ctx.fillStyle = '#ef4444';
+          ctx.fillStyle = isLatestBuy ? '#f43f5e' : '#ef4444';
           ctx.beginPath();
           ctx.moveTo(x, yAnchor);
-          ctx.lineTo(x - 4, yAnchor + 6);
-          ctx.lineTo(x + 4, yAnchor + 6);
+          ctx.lineTo(x - 5, yAnchor + 7);
+          ctx.lineTo(x + 5, yAnchor + 7);
           ctx.closePath();
           ctx.fill();
 
-          // Pill text label: 買 $xxx
-          const label = `買 $${trade.entryPrice}`;
-          ctx.font = 'bold 8.5px sans-serif';
+          // High-contrast badge: ▲ 買進 $xxx
+          const label = isLatestBuy ? `▲ 買進 $${price}` : `買 $${price}`;
+          ctx.font = 'bold 9px sans-serif';
           const textWidth = ctx.measureText(label).width;
-          const pillW = textWidth + 8;
-          const pillH = 13;
+          const pillW = textWidth + 10;
+          const pillH = 15;
           const pillX = Math.max(2, Math.min(chartRight - pillW, x - pillW / 2));
-          const pillY = yAnchor + 7;
+          const pillY = yAnchor + 8;
 
-          ctx.fillStyle = '#b91c1c';
+          ctx.fillStyle = isLatestBuy ? '#be123c' : '#b91c1c';
           ctx.fillRect(pillX, pillY, pillW, pillH);
-          ctx.strokeStyle = '#f87171';
-          ctx.lineWidth = 0.8;
+          ctx.strokeStyle = isLatestBuy ? '#fb7185' : '#f87171';
+          ctx.lineWidth = 1;
           ctx.strokeRect(pillX, pillY, pillW, pillH);
 
           ctx.fillStyle = '#ffffff';
           ctx.textAlign = 'center';
-          ctx.fillText(label, pillX + pillW / 2, pillY + 10);
+          ctx.fillText(label, pillX + pillW / 2, pillY + 11);
           ctx.restore();
         }
-
-        // 3. Exit / Stop-Loss Marker: ▼ (Placed above the candle)
-        if (exitIdx !== undefined) {
-          const c = visibleData[exitIdx];
-          const x = exitIdx * step + step / 2;
-          const yAnchor = Math.max(priceTop + 14, getY(c.high) - 8);
-
-          const isStopLoss = trade.exitReason.includes('停損') || trade.returnPct < 0;
-          const badgeColor = isStopLoss ? '#be123c' : '#047857';
-          const strokeColor = isStopLoss ? '#fb7185' : '#34d399';
-          const arrowColor = isStopLoss ? '#f43f5e' : '#10b981';
-          const label = isStopLoss
-            ? `停損 ${trade.returnPct}%`
-            : `停利 +${trade.returnPct}%`;
-
-          ctx.save();
-          // Downward Triangle Arrow
-          ctx.fillStyle = arrowColor;
-          ctx.beginPath();
-          ctx.moveTo(x, yAnchor);
-          ctx.lineTo(x - 4, yAnchor - 6);
-          ctx.lineTo(x + 4, yAnchor - 6);
-          ctx.closePath();
-          ctx.fill();
-
-          // Pill text label: 停損 -x% 或 停利 +x%
-          ctx.font = 'bold 8.5px sans-serif';
-          const textWidth = ctx.measureText(label).width;
-          const pillW = textWidth + 8;
-          const pillH = 13;
-          const pillX = Math.max(2, Math.min(chartRight - pillW, x - pillW / 2));
-          const pillY = yAnchor - 6 - pillH;
-
-          ctx.fillStyle = badgeColor;
-          ctx.fillRect(pillX, pillY, pillW, pillH);
-          ctx.strokeStyle = strokeColor;
-          ctx.lineWidth = 0.8;
-          ctx.strokeRect(pillX, pillY, pillW, pillH);
-
-          ctx.fillStyle = '#ffffff';
-          ctx.textAlign = 'center';
-          ctx.fillText(label, pillX + pillW / 2, pillY + 10);
-          ctx.restore();
-        }
-      });
+      }
     }
 
     // -------------------------------------------------------------
@@ -712,32 +780,272 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
       ctx.fillStyle = '#e2e8f0';
       ctx.fillText(c.time.slice(5), Math.max(4, activeX - 16), height - 4);
     }
-  }, [visibleData, showMAs, showBollinger, showTradeMarkers, trades, hoverIndex, dimensions, symbol]);
 
-  // Pointer interactions for dragging / panning
-  const handlePointerDown = (e: React.PointerEvent) => {
-    isDragging.current = true;
-    startX.current = e.clientX;
-    startOffset.current = offsetRight;
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    // -------------------------------------------------------------
+    // MOBILE CROSSHAIR LOCK INDICATOR & 2-SECOND LONG-PRESS RING
+    // -------------------------------------------------------------
+    if (isCrosshairLocked) {
+      const badgeText = '🔒 十字線已鎖定 · 長按2秒退出';
+      ctx.font = 'bold 10px sans-serif';
+      const textW = ctx.measureText(badgeText).width;
+      const boxW = textW + 16;
+      const boxX = Math.max(8, chartRight - boxW - 8);
+      const boxY = 6;
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.18)';
+      ctx.strokeStyle = 'rgba(245, 158, 11, 0.7)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(boxX, boxY, boxW, 20, 6);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#fcd34d';
+      ctx.fillText(badgeText, boxX + 8, boxY + 13.5);
+    }
+
+    if (longPressRing) {
+      const rx = Math.max(28, Math.min(chartRight - 28, longPressRing.x));
+      const ry = Math.max(28, Math.min(height - 28, longPressRing.y));
+      const radius = 20;
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      ctx.beginPath();
+      ctx.arc(rx, ry, radius, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(rx, ry, radius - 3, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.strokeStyle = longPressRing.exiting ? '#fb7185' : '#f59e0b';
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.arc(rx, ry, radius - 3, -Math.PI / 2, -Math.PI / 2 + longPressRing.progress * Math.PI * 2);
+      ctx.stroke();
+
+      const hintText = longPressRing.exiting ? '長按2秒退出十字線' : '長按2秒開啟十字線';
+      ctx.font = 'bold 10px sans-serif';
+      const hintW = ctx.measureText(hintText).width + 12;
+      const hintX = Math.max(4, Math.min(chartRight - hintW - 4, rx - hintW / 2));
+      const hintY = ry - radius - 22 > 4 ? ry - radius - 22 : ry + radius + 6;
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+      ctx.beginPath();
+      ctx.roundRect(hintX, hintY, hintW, 18, 4);
+      ctx.fill();
+      ctx.fillStyle = longPressRing.exiting ? '#fda4af' : '#fde68a';
+      ctx.fillText(hintText, hintX + 6, hintY + 12.5);
+      ctx.restore();
+    }
+  }, [visibleData, showMAs, showBollinger, showTradeMarkers, trades, strategySignal, hoverIndex, isCrosshairLocked, longPressRing, dimensions, symbol]);
+
+  const visibleDataLengthRef = useRef<number>(visibleData.length);
+  useEffect(() => {
+    visibleDataLengthRef.current = visibleData.length;
+  }, [visibleData.length]);
+
+  const longPressRef = useRef<{
+    timerId: ReturnType<typeof setTimeout> | null;
+    rafId: number | null;
+    startX: number;
+    startY: number;
+    localX: number;
+    localY: number;
+    startTime: number;
+    pointerId: number | null;
+    triggered: boolean;
+    moved: boolean;
+  }>({
+    timerId: null,
+    rafId: null,
+    startX: 0,
+    startY: 0,
+    localX: 0,
+    localY: 0,
+    startTime: 0,
+    pointerId: null,
+    triggered: false,
+    moved: false,
+  });
+
+  const cancelLongPress = () => {
+    if (longPressRef.current.timerId) {
+      clearTimeout(longPressRef.current.timerId);
+      longPressRef.current.timerId = null;
+    }
+    if (longPressRef.current.rafId !== null) {
+      cancelAnimationFrame(longPressRef.current.rafId);
+      longPressRef.current.rafId = null;
+    }
+    longPressRef.current.pointerId = null;
+    setLongPressRing(null);
   };
 
-  const handlePointerMove = (e: React.PointerEvent) => {
+  useEffect(() => {
+    return () => cancelLongPress();
+  }, []);
+
+  const updateHoverFromClientX = (clientX: number) => {
+    const canvas = canvasRef.current;
+    const count = visibleDataLengthRef.current;
+    if (!canvas || count <= 0) return false;
+    const rect = canvas.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const chartRight = rect.width - 64;
+    if (x >= 0 && x <= chartRight) {
+      const step = chartRight / count;
+      const idx = Math.floor(x / step);
+      setHoverIndex(Math.min(count - 1, Math.max(0, idx)));
+      return true;
+    }
+    return false;
+  };
+
+  // Pointer interactions: Desktop hover/pan vs Mobile 2s long-press crosshair lock mode
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === 'touch') {
+      // Multi-touch detected (e.g. second finger for pinch): abort long press
+      if (longPressRef.current.pointerId !== null && longPressRef.current.pointerId !== e.pointerId) {
+        cancelLongPress();
+        isDragging.current = false;
+        return;
+      }
+
+      const canvas = canvasRef.current;
+      const rect = canvas?.getBoundingClientRect();
+      const localX = rect ? e.clientX - rect.left : 0;
+      const localY = rect ? e.clientY - rect.top : 0;
+
+      cancelLongPress();
+      longPressRef.current.startX = e.clientX;
+      longPressRef.current.startY = e.clientY;
+      longPressRef.current.localX = localX;
+      longPressRef.current.localY = localY;
+      longPressRef.current.startTime = performance.now();
+      longPressRef.current.pointerId = e.pointerId;
+      longPressRef.current.triggered = false;
+      longPressRef.current.moved = false;
+
+      const startClientX = e.clientX;
+      const wasLocked = isCrosshairLockedRef.current;
+
+      const updateRing = () => {
+        if (longPressRef.current.pointerId !== e.pointerId) return;
+        const elapsed = performance.now() - longPressRef.current.startTime;
+        if (elapsed >= 250 && elapsed < 2000) {
+          setLongPressRing({
+            x: longPressRef.current.localX,
+            y: longPressRef.current.localY,
+            progress: Math.min(1, (elapsed - 250) / 1750),
+            exiting: wasLocked,
+          });
+        }
+        if (elapsed < 2000) {
+          longPressRef.current.rafId = requestAnimationFrame(updateRing);
+        }
+      };
+      longPressRef.current.rafId = requestAnimationFrame(updateRing);
+
+      longPressRef.current.timerId = setTimeout(() => {
+        longPressRef.current.triggered = true;
+        longPressRef.current.timerId = null;
+        if (longPressRef.current.rafId !== null) {
+          cancelAnimationFrame(longPressRef.current.rafId);
+          longPressRef.current.rafId = null;
+        }
+        setLongPressRing(null);
+        isDragging.current = false;
+        touchState.current.isPinching = false;
+
+        if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+          try { navigator.vibrate(35); } catch (_) {}
+        }
+
+        if (isCrosshairLockedRef.current) {
+          // 再次長按2秒 -> 退出十字線模式，解除K線固定鎖定
+          isCrosshairLockedRef.current = false;
+          setIsCrosshairLocked(false);
+          setHoverIndex(null);
+        } else {
+          // 長按2秒 -> 進入十字線模式並固定K線圖不會橫移或放大
+          isCrosshairLockedRef.current = true;
+          setIsCrosshairLocked(true);
+          updateHoverFromClientX(startClientX);
+        }
+      }, 2000);
+
+      // 十字線模式啟用時固定 K 線不橫移；未開啟十字線時可單指拖曳時間軸
+      if (isCrosshairLockedRef.current) {
+        isDragging.current = false;
+      } else {
+        isDragging.current = true;
+        startX.current = e.clientX;
+        startOffset.current = offsetRight;
+      }
+      return;
+    }
+
+    // Desktop mouse interaction
+    if (!isCrosshairLockedRef.current) {
+      isDragging.current = true;
+      startX.current = e.clientX;
+      startOffset.current = offsetRight;
+      try {
+        (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      } catch (_) {}
+    }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const chartRight = rect.width - 64;
 
+    if (e.pointerType === 'touch') {
+      if (longPressRef.current.pointerId === e.pointerId) {
+        const dist = Math.hypot(e.clientX - longPressRef.current.startX, e.clientY - longPressRef.current.startY);
+        if (dist > 12) {
+          longPressRef.current.moved = true;
+          cancelLongPress();
+          startX.current = e.clientX;
+          startOffset.current = offsetRight;
+        } else {
+          // 手指微幅抖動（12px 內）保留給長按 2 秒判定，不產生圖表位移
+          return;
+        }
+      }
+
+      if (isCrosshairLockedRef.current) {
+        // 十字線鎖定模式：固定K線不橫移，手指移動僅精準移動十字準星
+        isDragging.current = false;
+        if (!longPressRef.current.triggered) {
+          updateHoverFromClientX(e.clientX);
+        }
+      } else if (isDragging.current && !touchState.current.isPinching) {
+        // 非十字線模式：不顯示十字線，單指左右滑動可平移K線
+        const deltaX = e.clientX - startX.current;
+        const step = chartRight / visibleCount;
+        const deltaBars = Math.round(deltaX / step);
+        const newOffset = Math.max(0, Math.min(candles.length - visibleCount, startOffset.current + deltaBars));
+        setOffsetRight(newOffset);
+      }
+      return;
+    }
+
+    // Desktop mouse hover/drag
     if (x >= 0 && x <= chartRight && visibleData.length > 0) {
       const step = chartRight / visibleData.length;
       const idx = Math.floor(x / step);
       setHoverIndex(Math.min(visibleData.length - 1, Math.max(0, idx)));
-    } else {
+    } else if (!isCrosshairLockedRef.current) {
       setHoverIndex(null);
     }
 
-    if (isDragging.current) {
+    if (isDragging.current && !isCrosshairLockedRef.current) {
       const deltaX = e.clientX - startX.current;
       const step = chartRight / visibleCount;
       const deltaBars = Math.round(deltaX / step);
@@ -746,8 +1054,41 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
     }
   };
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === 'touch') {
+      if (
+        isCrosshairLockedRef.current &&
+        !longPressRef.current.triggered &&
+        !longPressRef.current.moved &&
+        longPressRef.current.pointerId === e.pointerId
+      ) {
+        updateHoverFromClientX(e.clientX);
+      }
+      cancelLongPress();
+      isDragging.current = false;
+      return;
+    }
+
     isDragging.current = false;
+    try {
+      (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch (_) {}
+  };
+
+  const handlePointerCancel = () => {
+    cancelLongPress();
+    isDragging.current = false;
+  };
+
+  const handlePointerLeave = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === 'touch') {
+      cancelLongPress();
+      isDragging.current = false;
+      return;
+    }
+    if (!isCrosshairLockedRef.current) {
+      setHoverIndex(null);
+    }
   };
 
   // Touch tracking for pinch-to-zoom on mobile devices
@@ -761,7 +1102,7 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
     isPinching: false,
   });
 
-  // Native touch event listeners on canvas to support fluid two-finger pinch zoom on mobile
+  // Native touch event listeners on canvas to support fluid two-finger pinch zoom (disabled when crosshair is locked)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -773,8 +1114,16 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
     };
 
     const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length >= 2) {
+        cancelLongPress();
+        isDragging.current = false;
+      }
       if (e.touches.length === 2) {
         e.preventDefault();
+        if (isCrosshairLockedRef.current) {
+          touchState.current.isPinching = false;
+          return;
+        }
         const dist = getTouchDistance(e.touches[0], e.touches[1]);
         touchState.current = {
           initialDistance: dist,
@@ -785,13 +1134,14 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
     };
 
     const onTouchMove = (e: TouchEvent) => {
-      if (e.touches.length === 2 && touchState.current.isPinching) {
+      if (e.touches.length === 2) {
         e.preventDefault();
+        if (isCrosshairLockedRef.current || !touchState.current.isPinching) {
+          return;
+        }
         const currentDist = getTouchDistance(e.touches[0], e.touches[1]);
         if (touchState.current.initialDistance > 0 && currentDist > 0) {
           const ratio = currentDist / touchState.current.initialDistance;
-          // When fingers spread outward (ratio > 1), zoom in (visibleCount decreases)
-          // When fingers pinch inward (ratio < 1), zoom out (visibleCount increases)
           const targetVisible = Math.round(touchState.current.initialVisibleCount / ratio);
           const boundedVisible = Math.max(15, Math.min(candles.length || 75, targetVisible));
           setVisibleCount(boundedVisible);
@@ -818,15 +1168,16 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
     };
   }, [visibleCount, candles.length]);
 
-  // Native non-passive Wheel listener to reliably preventDefault (prevent window/page scrolling)
+  // Native non-passive Wheel listener to reliably preventDefault (disabled when crosshair is locked)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     const onWheel = (e: WheelEvent) => {
-      // Non-passive listener guarantees browser page scrolling is strictly stopped
       e.preventDefault();
       e.stopPropagation();
+
+      if (isCrosshairLockedRef.current) return;
 
       const rect = canvas.getBoundingClientRect();
       const mouseX = e.clientX - rect.left;
@@ -977,6 +1328,43 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
         </div>
       </div>
 
+      {/* Persistent Strategy Signal Status Banner */}
+      {strategySignal && strategySignal.status === 'BUY' && (
+        <div className="px-3 py-1.5 bg-gradient-to-r from-rose-950 via-red-950/90 to-slate-900 border-b border-rose-500/50 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="flex items-center gap-1 font-bold bg-rose-600 text-white px-2 py-0.5 rounded shadow-sm text-xs animate-pulse">
+              🔥 策略買進訊號 (BUY)
+            </span>
+            <span className="text-rose-200 font-semibold">{strategySignal.statusDesc || '符合量化進場條件'}</span>
+            {strategySignal.entryPrice && (
+              <span className="font-mono text-rose-300 font-bold bg-rose-900/60 px-1.5 py-0.5 rounded border border-rose-700/50">
+                觸發買價: ${strategySignal.entryPrice}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2 text-[11px] text-slate-300 font-mono">
+            <span>勝率 <strong className="text-emerald-400">{strategySignal.winRate}%</strong></span>
+            <span>·</span>
+            <span>期望值 <strong className={strategySignal.expectancyPct >= 0 ? 'text-rose-400' : 'text-emerald-400'}>{strategySignal.expectancyPct > 0 ? `+${strategySignal.expectancyPct}%` : `${strategySignal.expectancyPct}%`}</strong></span>
+            <span>·</span>
+            <span>回撤 <strong className="text-amber-400">{strategySignal.maxDrawdownPct}%</strong></span>
+          </div>
+        </div>
+      )}
+      {strategySignal && strategySignal.status === 'HOLD' && (
+        <div className="px-3 py-1 bg-amber-950/60 border-b border-amber-600/30 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-200">
+          <div className="flex items-center gap-2">
+            <span className="font-bold bg-amber-600/80 text-white px-1.5 py-0.2 rounded text-[11px]">
+              🔒 策略續抱中 (HOLD)
+            </span>
+            <span className="text-slate-300 text-[11px]">{strategySignal.statusDesc}</span>
+            {strategySignal.entryPrice && (
+              <span className="font-mono text-amber-300 text-[11px]">進場價: ${strategySignal.entryPrice}</span>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Crosshair / Active Bar Minimal Clean Info Banner */}
       {activeHoverCandle && (
         <div className="px-3 py-1.5 bg-slate-950/95 border-b border-slate-800/60 text-xs font-mono flex flex-wrap items-center justify-between gap-2 text-slate-300">
@@ -1050,40 +1438,6 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
               )}
             </div>
           )}
-
-          {/* Hovered Candle Strategy Signal Banner */}
-          {hoverTradeInfo?.entryTrade && (
-            <div className="flex items-center gap-1.5 bg-red-950/80 border border-red-700/80 text-red-200 px-2 py-0.5 rounded text-[11px] font-sans mt-1">
-              <span className="font-bold text-red-300">🎯 策略進場買進</span>
-              <span>成本: ${hoverTradeInfo.entryTrade.entryPrice}</span>
-              <span>部位: {hoverTradeInfo.entryTrade.shares.toLocaleString()}股</span>
-              {hoverTradeInfo.entryTrade.status === 'OPEN' && (
-                <span className="bg-emerald-900 text-emerald-200 px-1 py-0.2 rounded text-[10px] font-bold border border-emerald-600/60">
-                  🟢 持倉中 (未平倉)
-                </span>
-              )}
-            </div>
-          )}
-
-          {hoverTradeInfo?.exitTrade && (
-            <div
-              className={`flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-sans border mt-1 ${
-                hoverTradeInfo.exitTrade.isWin
-                  ? 'bg-emerald-950/80 border-emerald-700/80 text-emerald-200'
-                  : 'bg-rose-950/80 border-rose-700/80 text-rose-200'
-              }`}
-            >
-              <span className="font-bold">
-                {hoverTradeInfo.exitTrade.exitReason?.includes('停損') ? '🛑 策略停損觸發' : '🎉 策略出場平倉'}
-              </span>
-              <span>出場價: ${hoverTradeInfo.exitTrade.exitPrice}</span>
-              <span>部位: {hoverTradeInfo.exitTrade.shares.toLocaleString()}股</span>
-              <span>({hoverTradeInfo.exitTrade.exitReason})</span>
-              <span className="font-bold">
-                {hoverTradeInfo.exitTrade.returnPct > 0 ? '+' : ''}{hoverTradeInfo.exitTrade.returnPct}%
-              </span>
-            </div>
-          )}
         </div>
       )}
 
@@ -1121,7 +1475,9 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
-          onPointerLeave={() => setHoverIndex(null)}
+          onPointerCancel={handlePointerCancel}
+          onPointerLeave={handlePointerLeave}
+          onContextMenu={(e) => e.preventDefault()}
         />
 
         {/* Legend Overlay for Quick Reading */}
@@ -1157,10 +1513,10 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
 
       {/* Bottom status bar for zoom & pan guidance */}
       <div className="px-3 py-1.5 bg-slate-950/90 border-t border-slate-800/80 text-[11px] text-slate-500 flex items-center justify-between">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <span>滾輪/雙指縮放</span>
           <span>·</span>
-          <span>按住左右平移時間軸</span>
+          <span>手機長按2秒開關十字線（鎖定圖表）</span>
           <span>·</span>
           <span>十字準星同步掃描 K線、回測信號、成交量、KD、MACD</span>
         </div>

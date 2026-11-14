@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { CandleData, StrategyConfig } from '../types/stock.ts';
+import { CandleData, StrategyConfig, StockStrategySignal } from '../types/stock.ts';
 import { calculateIndicators } from '../utils/indicators.ts';
 import { generateFallbackCandles } from '../services/clientStockFallback.ts';
 import { evaluateStrategySignal, DEFAULT_STRATEGY } from '../utils/backtestEngine.ts';
@@ -31,11 +31,17 @@ interface TopSectorStocksKLineViewerProps {
   onOpenStockDetail?: (stock: any) => void;
 }
 
-// 簡易 K 線微型圖表元件 (Mini Candlestick Chart - 密集高密度精簡版)
-const MiniKLineChart: React.FC<{ candles: CandleData[]; width?: number; height?: number }> = ({
+// 簡易 K 線微型圖表元件 (Mini Candlestick Chart - 密集高密度精簡版，精準標記買進/持有/賣出訊號)
+const MiniKLineChart: React.FC<{
+  candles: CandleData[];
+  width?: number;
+  height?: number;
+  strategySignal?: StockStrategySignal;
+}> = ({
   candles,
-  width = 105,
-  height = 28,
+  width = 115,
+  height = 36,
+  strategySignal,
 }) => {
   if (!candles || candles.length === 0) {
     return <span className="text-[9px] text-slate-500 font-mono">載入中...</span>;
@@ -44,70 +50,172 @@ const MiniKLineChart: React.FC<{ candles: CandleData[]; width?: number; height?:
   const minPrice = Math.min(...slice.map(c => c.low)) || 1;
   const maxPrice = Math.max(...slice.map(c => c.high)) || 1;
   const range = Math.max(0.1, maxPrice - minPrice);
-  const pad = 2;
+  const pad = 3;
+
+  // 尋找買進/持有/賣出觸發點 K 線位置
+  const status = strategySignal?.status;
+  let signalIdx = -1;
+  if (strategySignal?.entryDate) {
+    signalIdx = slice.findIndex(c => c.time === strategySignal.entryDate);
+  }
+  if (signalIdx === -1 && status === 'BUY') {
+    signalIdx = slice.length - 1; // 最新交易日即為買進點
+  }
+
+  const signalCandle = signalIdx !== -1 ? slice[signalIdx] : null;
+  const candleW = Math.max(1.8, (width / slice.length) * 0.72);
+  const signalX = signalIdx !== -1
+    ? (signalIdx / (slice.length - 1 || 1)) * (width - candleW - pad * 2) + pad + candleW / 2
+    : 0;
+  const signalYLow = signalCandle
+    ? height - pad - ((signalCandle.low - minPrice) / range) * (height - pad * 2)
+    : 0;
 
   return (
     <div className="flex flex-col items-center">
-      <svg width={width} height={height} className="select-none overflow-hidden rounded bg-slate-950 border border-slate-800/80 p-0.5">
-        {/* 中軸輔助線 */}
-        <line x1="0" y1={height / 2} x2={width} y2={height / 2} stroke="#1e293b" strokeDasharray="2,2" strokeWidth="0.6" />
+      <div className="relative">
+        <svg width={width} height={height} className="select-none overflow-visible rounded bg-slate-950 border border-slate-800/80 p-0.5">
+          {/* 中軸輔助線 */}
+          <line x1="0" y1={height / 2} x2={width} y2={height / 2} stroke="#1e293b" strokeDasharray="2,2" strokeWidth="0.6" />
 
-        {/* 蠟燭圖 */}
-        {slice.map((c, i) => {
-          const w = Math.max(1.4, (width / slice.length) * 0.72);
-          const x = (i / (slice.length - 1 || 1)) * (width - w - pad * 2) + pad;
-          const isUp = c.close >= c.open;
-          const yHigh = height - pad - ((c.high - minPrice) / range) * (height - pad * 2);
-          const yLow = height - pad - ((c.low - minPrice) / range) * (height - pad * 2);
-          const yOpen = height - pad - ((c.open - minPrice) / range) * (height - pad * 2);
-          const yClose = height - pad - ((c.close - minPrice) / range) * (height - pad * 2);
-          const yTop = Math.min(yOpen, yClose);
-          const bodyH = Math.max(1, Math.abs(yClose - yOpen));
+          {/* 蠟燭圖 */}
+          {slice.map((c, i) => {
+            const w = candleW;
+            const x = (i / (slice.length - 1 || 1)) * (width - w - pad * 2) + pad;
+            const isUp = c.close >= c.open;
+            const yHigh = height - pad - ((c.high - minPrice) / range) * (height - pad * 2);
+            const yLow = height - pad - ((c.low - minPrice) / range) * (height - pad * 2);
+            const yOpen = height - pad - ((c.open - minPrice) / range) * (height - pad * 2);
+            const yClose = height - pad - ((c.close - minPrice) / range) * (height - pad * 2);
+            const yTop = Math.min(yOpen, yClose);
+            const bodyH = Math.max(1, Math.abs(yClose - yOpen));
 
-          return (
-            <g key={i}>
-              <line x1={x + w / 2} y1={yHigh} x2={x + w / 2} y2={yLow} stroke={isUp ? '#f43f5e' : '#10b981'} strokeWidth="0.7" />
-              <rect x={x} y={yTop} width={w} height={bodyH} fill={isUp ? '#f43f5e' : '#10b981'} rx="0.2" />
+            return (
+              <g key={i}>
+                <line x1={x + w / 2} y1={yHigh} x2={x + w / 2} y2={yLow} stroke={isUp ? '#f43f5e' : '#10b981'} strokeWidth="0.7" />
+                <rect x={x} y={yTop} width={w} height={bodyH} fill={isUp ? '#f43f5e' : '#10b981'} rx="0.2" />
+              </g>
+            );
+          })}
+
+          {/* 5MA (黃線) */}
+          <polyline
+            fill="none"
+            stroke="#fbbf24"
+            strokeWidth="0.8"
+            points={slice
+              .map((c, i) => {
+                if (!c.ma5) return '';
+                const x = (i / (slice.length - 1 || 1)) * (width - pad * 2) + pad;
+                const y = height - pad - ((c.ma5 - minPrice) / range) * (height - pad * 2);
+                return `${x},${y}`;
+              })
+              .filter(Boolean)
+              .join(' ')}
+          />
+
+          {/* 20MA (藍線) */}
+          <polyline
+            fill="none"
+            stroke="#38bdf8"
+            strokeWidth="0.8"
+            points={slice
+              .map((c, i) => {
+                if (!c.ma20) return '';
+                const x = (i / (slice.length - 1 || 1)) * (width - pad * 2) + pad;
+                const y = height - pad - ((c.ma20 - minPrice) / range) * (height - pad * 2);
+                return `${x},${y}`;
+              })
+              .filter(Boolean)
+              .join(' ')}
+          />
+
+          {/* 🔥 策略訊號：K 線圖上明確標記【買進】點 (▲ 買進標記與垂直引線) */}
+          {status === 'BUY' && signalIdx !== -1 && (
+            <g className="animate-pulse">
+              {/* 買進觸發柱引線 */}
+              <line
+                x1={signalX}
+                y1={0}
+                x2={signalX}
+                y2={height}
+                stroke="#f43f5e"
+                strokeWidth="0.8"
+                strokeDasharray="2,2"
+                opacity="0.85"
+              />
+              {/* 買進紅色三角形箭頭 ▲ 頂住蠟燭下影線 */}
+              <polygon
+                points={`${signalX},${Math.min(height - 10, signalYLow + 1)} ${signalX - 3.5},${Math.min(height - 3, signalYLow + 7)} ${signalX + 3.5},${Math.min(height - 3, signalYLow + 7)}`}
+                fill="#f43f5e"
+                stroke="#ffffff"
+                strokeWidth="0.6"
+              />
+              {/* 買進標籤膠囊 */}
+              <rect
+                x={Math.max(1, Math.min(width - 23, signalX - 11.5))}
+                y={Math.min(height - 8, Math.max(1, signalYLow + 7))}
+                width={23}
+                height={8.5}
+                rx={1.5}
+                fill="#be123c"
+                stroke="#fda4af"
+                strokeWidth="0.6"
+              />
+              <text
+                x={Math.max(1, Math.min(width - 23, signalX - 11.5)) + 11.5}
+                y={Math.min(height - 8, Math.max(1, signalYLow + 7)) + 6.4}
+                textAnchor="middle"
+                fill="#ffffff"
+                fontSize="6"
+                fontWeight="900"
+                fontFamily="sans-serif"
+              >
+                買進
+              </text>
             </g>
-          );
-        })}
+          )}
 
-        {/* 5MA (黃線) */}
-        <polyline
-          fill="none"
-          stroke="#fbbf24"
-          strokeWidth="0.8"
-          points={slice
-            .map((c, i) => {
-              if (!c.ma5) return '';
-              const x = (i / (slice.length - 1 || 1)) * (width - pad * 2) + pad;
-              const y = height - pad - ((c.ma5 - minPrice) / range) * (height - pad * 2);
-              return `${x},${y}`;
-            })
-            .filter(Boolean)
-            .join(' ')}
-        />
+          {/* 持倉續抱標記 */}
+          {status === 'HOLD' && signalIdx !== -1 && (
+            <g>
+              <circle cx={signalX} cy={signalYLow + 4} r="2" fill="#10b981" stroke="#ffffff" strokeWidth="0.5" />
+            </g>
+          )}
 
-        {/* 20MA (藍線) */}
-        <polyline
-          fill="none"
-          stroke="#38bdf8"
-          strokeWidth="0.8"
-          points={slice
-            .map((c, i) => {
-              if (!c.ma20) return '';
-              const x = (i / (slice.length - 1 || 1)) * (width - pad * 2) + pad;
-              const y = height - pad - ((c.ma20 - minPrice) / range) * (height - pad * 2);
-              return `${x},${y}`;
-            })
-            .filter(Boolean)
-            .join(' ')}
-        />
-      </svg>
-      <div className="flex justify-between w-full text-[7px] font-mono text-slate-500 leading-none mt-0.5 px-0.5">
-        <span>L:{minPrice.toFixed(0)}</span>
-        <span className="text-slate-400">30K·MA5/20</span>
-        <span>H:{maxPrice.toFixed(0)}</span>
+          {/* 賣出平倉標記 */}
+          {status === 'SELL' && signalIdx !== -1 && (
+            <g>
+              <polygon
+                points={`${signalX},${Math.max(1, signalYLow - 1)} ${signalX - 3},${Math.max(6, signalYLow - 5)} ${signalX + 3},${Math.max(6, signalYLow - 5)}`}
+                fill="#f59e0b"
+                stroke="#ffffff"
+                strokeWidth="0.5"
+              />
+            </g>
+          )}
+        </svg>
+      </div>
+
+      <div className="flex justify-between items-center w-full text-[7.5px] font-mono leading-none mt-0.5 px-0.5">
+        <span className="text-slate-400">${minPrice.toFixed(0)}</span>
+        {status === 'BUY' ? (
+          <span className="text-rose-400 font-bold flex items-center gap-0.5 bg-rose-950/90 px-1 py-0.2 rounded border border-rose-500/50">
+            <span>▲ 買進點</span>
+            <span>${strategySignal?.entryPrice || signalCandle?.close}</span>
+          </span>
+        ) : status === 'HOLD' ? (
+          <span className="text-emerald-400 font-bold flex items-center gap-0.5 bg-emerald-950/80 px-1 py-0.2 rounded border border-emerald-500/50">
+            <span>● 續抱中</span>
+          </span>
+        ) : status === 'SELL' ? (
+          <span className="text-amber-400 font-bold flex items-center gap-0.5 bg-amber-950/80 px-1 py-0.2 rounded border border-amber-500/50">
+            <span>▼ 賣出</span>
+          </span>
+        ) : (
+          <span className="text-slate-400">30K·MA5/20</span>
+        )}
+        <span className="text-slate-400">${maxPrice.toFixed(0)}</span>
       </div>
     </div>
   );
@@ -700,9 +808,9 @@ export const TopSectorStocksKLineViewer: React.FC<TopSectorStocksKLineViewerProp
                       </div>
                     </td>
 
-                    {/* 6. 簡易 K 線 (高密度微縮版) */}
+                    {/* 6. 簡易 K 線 (高密度微縮版，帶有買進標記) */}
                     <td className="py-1 px-1.5 text-center whitespace-nowrap">
-                      <MiniKLineChart candles={stk.candles} width={105} height={28} />
+                      <MiniKLineChart candles={stk.candles} strategySignal={stk.strategySignal} width={115} height={36} />
                     </td>
 
                     {/* 7. 看盤按鈕 */}
@@ -764,7 +872,7 @@ export const TopSectorStocksKLineViewer: React.FC<TopSectorStocksKLineViewerProp
                 </div>
 
                 <div className="w-full flex justify-center py-1 bg-slate-900/60 rounded-xl border border-slate-800/80">
-                  <MiniKLineChart candles={stk.candles} width={280} height={60} />
+                  <MiniKLineChart candles={stk.candles} strategySignal={stk.strategySignal} width={280} height={60} />
                 </div>
 
                 <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-900">

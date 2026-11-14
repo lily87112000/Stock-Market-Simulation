@@ -403,6 +403,7 @@ export default function App() {
               symbol={currentSymbol}
               stockName={stockName}
               trades={backtestTrades}
+              strategySignal={currentStrategySignal}
               isLoading={isCandlesLoading}
               selectedRange={currentRange}
               onRangeChange={setCurrentRange}
