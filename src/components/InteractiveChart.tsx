@@ -782,25 +782,8 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
     }
 
     // -------------------------------------------------------------
-    // MOBILE CROSSHAIR LOCK INDICATOR & 2-SECOND LONG-PRESS RING
+    // MOBILE 1.5-SECOND LONG-PRESS RING
     // -------------------------------------------------------------
-    if (isCrosshairLocked) {
-      const badgeText = '🔒 十字線已鎖定 · 長按2秒退出';
-      ctx.font = 'bold 10px sans-serif';
-      const textW = ctx.measureText(badgeText).width;
-      const boxW = textW + 16;
-      const boxX = Math.max(8, chartRight - boxW - 8);
-      const boxY = 6;
-      ctx.fillStyle = 'rgba(245, 158, 11, 0.18)';
-      ctx.strokeStyle = 'rgba(245, 158, 11, 0.7)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(boxX, boxY, boxW, 20, 6);
-      ctx.fill();
-      ctx.stroke();
-      ctx.fillStyle = '#fcd34d';
-      ctx.fillText(badgeText, boxX + 8, boxY + 13.5);
-    }
 
     if (longPressRing) {
       const rx = Math.max(28, Math.min(chartRight - 28, longPressRing.x));
@@ -825,18 +808,6 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
       ctx.beginPath();
       ctx.arc(rx, ry, radius - 3, -Math.PI / 2, -Math.PI / 2 + longPressRing.progress * Math.PI * 2);
       ctx.stroke();
-
-      const hintText = longPressRing.exiting ? '長按2秒退出十字線' : '長按2秒開啟十字線';
-      ctx.font = 'bold 10px sans-serif';
-      const hintW = ctx.measureText(hintText).width + 12;
-      const hintX = Math.max(4, Math.min(chartRight - hintW - 4, rx - hintW / 2));
-      const hintY = ry - radius - 22 > 4 ? ry - radius - 22 : ry + radius + 6;
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
-      ctx.beginPath();
-      ctx.roundRect(hintX, hintY, hintW, 18, 4);
-      ctx.fill();
-      ctx.fillStyle = longPressRing.exiting ? '#fda4af' : '#fde68a';
-      ctx.fillText(hintText, hintX + 6, hintY + 12.5);
       ctx.restore();
     }
   }, [visibleData, showMAs, showBollinger, showTradeMarkers, trades, strategySignal, hoverIndex, isCrosshairLocked, longPressRing, dimensions, symbol]);
@@ -903,7 +874,7 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
     return false;
   };
 
-  // Pointer interactions: Desktop hover/pan vs Mobile 2s long-press crosshair lock mode
+  // Pointer interactions: Desktop hover/pan vs Mobile 1.5s long-press crosshair lock mode
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (e.pointerType === 'touch') {
       // Multi-touch detected (e.g. second finger for pinch): abort long press
@@ -930,19 +901,21 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
 
       const startClientX = e.clientX;
       const wasLocked = isCrosshairLockedRef.current;
+      const LONG_PRESS_DURATION_MS = 1500;
+      const RING_DELAY_MS = 200;
 
       const updateRing = () => {
         if (longPressRef.current.pointerId !== e.pointerId) return;
         const elapsed = performance.now() - longPressRef.current.startTime;
-        if (elapsed >= 250 && elapsed < 2000) {
+        if (elapsed >= RING_DELAY_MS && elapsed < LONG_PRESS_DURATION_MS) {
           setLongPressRing({
             x: longPressRef.current.localX,
             y: longPressRef.current.localY,
-            progress: Math.min(1, (elapsed - 250) / 1750),
+            progress: Math.min(1, (elapsed - RING_DELAY_MS) / (LONG_PRESS_DURATION_MS - RING_DELAY_MS)),
             exiting: wasLocked,
           });
         }
-        if (elapsed < 2000) {
+        if (elapsed < LONG_PRESS_DURATION_MS) {
           longPressRef.current.rafId = requestAnimationFrame(updateRing);
         }
       };
@@ -964,17 +937,17 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
         }
 
         if (isCrosshairLockedRef.current) {
-          // 再次長按2秒 -> 退出十字線模式，解除K線固定鎖定
+          // 再次長按1.5秒 -> 退出十字線模式，解除K線固定鎖定
           isCrosshairLockedRef.current = false;
           setIsCrosshairLocked(false);
           setHoverIndex(null);
         } else {
-          // 長按2秒 -> 進入十字線模式並固定K線圖不會橫移或放大
+          // 長按1.5秒 -> 進入十字線模式並固定K線圖不會橫移或放大
           isCrosshairLockedRef.current = true;
           setIsCrosshairLocked(true);
           updateHoverFromClientX(startClientX);
         }
-      }, 2000);
+      }, LONG_PRESS_DURATION_MS);
 
       // 十字線模式啟用時固定 K 線不橫移；未開啟十字線時可單指拖曳時間軸
       if (isCrosshairLockedRef.current) {
@@ -1014,7 +987,7 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
           startX.current = e.clientX;
           startOffset.current = offsetRight;
         } else {
-          // 手指微幅抖動（12px 內）保留給長按 2 秒判定，不產生圖表位移
+          // 手指微幅抖動（12px 內）保留給長按 1.5 秒判定，不產生圖表位移
           return;
         }
       }
@@ -1515,8 +1488,6 @@ export const InteractiveChart: React.FC<InteractiveChartProps> = ({
       <div className="px-3 py-1.5 bg-slate-950/90 border-t border-slate-800/80 text-[11px] text-slate-500 flex items-center justify-between">
         <div className="flex items-center gap-2 flex-wrap">
           <span>滾輪/雙指縮放</span>
-          <span>·</span>
-          <span>手機長按2秒開關十字線（鎖定圖表）</span>
           <span>·</span>
           <span>十字準星同步掃描 K線、回測信號、成交量、KD、MACD</span>
         </div>

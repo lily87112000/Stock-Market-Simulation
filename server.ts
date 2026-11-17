@@ -14,7 +14,11 @@ const __dirname = path.dirname(__filename);
 // Support CLI args --port and --host as passed by AI Studio runner
 const portArgIdx = process.argv.indexOf('--port');
 const cliPort = portArgIdx !== -1 && process.argv[portArgIdx + 1] ? Number(process.argv[portArgIdx + 1]) : null;
-const PORT = cliPort || Number(process.env.PORT) || 3000;
+const envPort =
+  process.env.PORT && process.env.PORT !== process.env.NGINX_PORT
+    ? Number(process.env.PORT)
+    : null;
+const PORT = cliPort || envPort || Number(process.env.DEFAULT_APP_PORT) || 3000;
 
 const hostArgIdx = process.argv.indexOf('--host');
 const cliHost = hostArgIdx !== -1 && process.argv[hostArgIdx + 1] ? process.argv[hostArgIdx + 1] : null;
@@ -32,12 +36,14 @@ process.on('uncaughtException', (err) => {
 async function startServer() {
   const httpServer = http.createServer(app);
   let vite: Awaited<ReturnType<typeof createViteServer>> | null = null;
+  const hmrDisabled = process.env.DISABLE_HMR === 'true';
 
   if (process.env.NODE_ENV !== 'production') {
     vite = await createViteServer({
       server: {
-        middlewareMode: true,
-        hmr: process.env.DISABLE_HMR !== 'true' ? { server: httpServer } : false,
+        middlewareMode: hmrDisabled ? true : { server: httpServer },
+        hmr: !hmrDisabled,
+        ws: hmrDisabled ? false : undefined,
       },
       appType: 'spa',
     });

@@ -2005,136 +2005,244 @@ async function getLiveTaifexRetailData(forceRefresh = false) {
     }
   });
 
-  try {
-    // 直連臺灣期貨交易所官方 futContractsDateDown 下載最新三大法人微型臺指 (TMF) 留倉數據 (Big5 編碼解碼)
-    const p = new URLSearchParams();
-    p.append('queryStartDate', '2026/10/01');
-    p.append('queryEndDate', '2026/11/15');
-    p.append('commodityId', 'TMF');
+  // 計算台灣當地時間 (Asia/Taipei) 起迄查詢日期，避免寫死過期日期
+  const twNowStr = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Taipei' }).format(new Date()); // YYYY-MM-DD
+  const twNow = new Date(`${twNowStr}T00:00:00Z`);
+  const oneYearAgo = new Date(twNow);
+  oneYearAgo.setUTCFullYear(oneYearAgo.getUTCFullYear() - 1);
+  const twoYearsAgo = new Date(twNow);
+  twoYearsAgo.setUTCFullYear(twoYearsAgo.getUTCFullYear() - 2);
+  const twentyFiveDaysAgo = new Date(twNow);
+  twentyFiveDaysAgo.setUTCDate(twentyFiveDaysAgo.getUTCDate() - 25);
 
-    const res: any = await Promise.race([
+  const todaySlash = twNowStr.replace(/-/g, '/');
+  const oneYearAgoSlash = oneYearAgo.toISOString().slice(0, 10).replace(/-/g, '/');
+  const twentyFiveDaysAgoSlash = twentyFiveDaysAgo.toISOString().slice(0, 10).replace(/-/g, '/');
+  const twoYearsAgoDash = twoYearsAgo.toISOString().slice(0, 10);
+
+  const instByDate = new Map<string, { instLong: number; instShort: number }>();
+  const totalOiByDate = new Map<string, number>();
+
+  // 1. 平行抓取：
+  //   (a) FinMind TaiwanFuturesInstitutionalInvestors (涵蓋近2年每日 TMF 三大法人留倉)
+  //   (b) FinMind TaiwanFuturesDaily (涵蓋近2年每日 TMF 全市場一般交易未平倉總量)
+  //   (c) TAIFEX 官方 futContractsDateDown (近1年 TMF 三大法人留倉 Big5 CSV)
+  //   (d) TAIFEX 官方 futDataDown (近25天 TMF 每日未平倉 Big5 CSV)
+  const taifexInstParams = new URLSearchParams();
+  taifexInstParams.append('queryStartDate', oneYearAgoSlash);
+  taifexInstParams.append('queryEndDate', todaySlash);
+  taifexInstParams.append('commodityId', 'TMF');
+
+  const taifexDailyParams = new URLSearchParams();
+  taifexDailyParams.append('down_type', '1');
+  taifexDailyParams.append('queryStartDate', twentyFiveDaysAgoSlash);
+  taifexDailyParams.append('queryEndDate', todaySlash);
+  taifexDailyParams.append('commodity_id', 'TMF');
+
+  const [fmInstRes, fmDailyRes, taifexInstRes, taifexDailyRes] = await Promise.allSettled([
+    Promise.race([
+      fetch(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanFuturesInstitutionalInvestors&data_id=TMF&start_date=${twoYearsAgoDash}`),
+      new Promise<any>((_, reject) => setTimeout(() => reject(new Error('FinMind TMF inst timeout')), 6500)),
+    ]),
+    Promise.race([
+      fetch(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanFuturesDaily&data_id=TMF&start_date=${twoYearsAgoDash}`),
+      new Promise<any>((_, reject) => setTimeout(() => reject(new Error('FinMind TMF daily timeout')), 6500)),
+    ]),
+    Promise.race([
       fetch('https://www.taifex.com.tw/cht/3/futContractsDateDown', {
         method: 'POST',
-        body: p,
+        body: taifexInstParams,
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       }),
-      new Promise<any>((_, reject) => setTimeout(() => reject(new Error('TAIFEX download timeout')), 6000)),
-    ]);
+      new Promise<any>((_, reject) => setTimeout(() => reject(new Error('TAIFEX futContractsDateDown timeout')), 6500)),
+    ]),
+    Promise.race([
+      fetch('https://www.taifex.com.tw/cht/3/futDataDown', {
+        method: 'POST',
+        body: taifexDailyParams,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      }),
+      new Promise<any>((_, reject) => setTimeout(() => reject(new Error('TAIFEX futDataDown timeout')), 6500)),
+    ]),
+  ]);
 
-    if (res && res.ok) {
-      const buf = await res.arrayBuffer();
+  // 解析 (a) FinMind 近 2 年 TMF 三大法人留倉（作為歷史基底）
+  if (fmInstRes.status === 'fulfilled' && fmInstRes.value?.ok) {
+    try {
+      const fmJson: any = await fmInstRes.value.json();
+      if (Array.isArray(fmJson?.data)) {
+        for (const row of fmJson.data) {
+          const dt = String(row.date || '').trim();
+          if (!dt) continue;
+          const longOI = Number(row.long_open_interest_balance_volume) || 0;
+          const shortOI = Number(row.short_open_interest_balance_volume) || 0;
+          const cur = instByDate.get(dt) || { instLong: 0, instShort: 0 };
+          cur.instLong += longOI;
+          cur.instShort += shortOI;
+          instByDate.set(dt, cur);
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 解析 (b) FinMind 近 2 年 TMF 全市場未平倉量（僅加總 position 時段且非價差契約）
+  if (fmDailyRes.status === 'fulfilled' && fmDailyRes.value?.ok) {
+    try {
+      const fmDailyJson: any = await fmDailyRes.value.json();
+      if (Array.isArray(fmDailyJson?.data)) {
+        for (const row of fmDailyJson.data) {
+          if (row.trading_session !== 'position') continue;
+          const contractDate = String(row.contract_date || '');
+          if (!contractDate || contractDate.includes('/')) continue;
+          const dt = String(row.date || '').trim();
+          const oi = Number(row.open_interest) || 0;
+          if (dt && oi > 0) {
+            totalOiByDate.set(dt, (totalOiByDate.get(dt) || 0) + oi);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 解析 (c) TAIFEX 官方 futContractsDateDown（直接覆寫為官方最新值）
+  if (taifexInstRes.status === 'fulfilled' && taifexInstRes.value?.ok) {
+    try {
+      const buf = await taifexInstRes.value.arrayBuffer();
       const text = new TextDecoder('big5').decode(buf);
       const lines = text.split('\n').filter(l => l.trim().length > 0);
-
-      const byDate = new Map<string, { instLong: number; instShort: number }>();
+      const taifexTemp = new Map<string, { instLong: number; instShort: number }>();
       for (let i = 1; i < lines.length; i++) {
         const parts = lines[i].split(',');
         if (parts.length >= 14) {
           const dt = parts[0].trim().replace(/\//g, '-');
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(dt)) continue;
           const longOI = parseInt(parts[9], 10) || 0;
           const shortOI = parseInt(parts[11], 10) || 0;
-          const cur = byDate.get(dt) || { instLong: 0, instShort: 0 };
+          const cur = taifexTemp.get(dt) || { instLong: 0, instShort: 0 };
           cur.instLong += longOI;
           cur.instShort += shortOI;
-          byDate.set(dt, cur);
+          taifexTemp.set(dt, cur);
         }
       }
+      taifexTemp.forEach((val, dt) => instByDate.set(dt, val));
+    } catch (_) {}
+  }
 
-      if (byDate.size > 0) {
-        const sortedDates = Array.from(byDate.keys()).sort();
-        const latestDt = sortedDates[sortedDates.length - 1];
-        const latestInst = byDate.get(latestDt)!;
-        const instNet = latestInst.instLong - latestInst.instShort;
+  // 解析 (d) TAIFEX 官方 futDataDown（僅加總「一般」交易時段且非價差單，直接覆寫最近日期）
+  if (taifexDailyRes.status === 'fulfilled' && taifexDailyRes.value?.ok) {
+    try {
+      const buf = await taifexDailyRes.value.arrayBuffer();
+      const text = new TextDecoder('big5').decode(buf);
+      const lines = text.split('\n').filter(l => l.trim().length > 0);
+      const taifexOiTemp = new Map<string, number>();
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(',');
+        if (cols.length >= 18) {
+          const dt = cols[0].trim().replace(/\//g, '-');
+          const month = cols[2].trim();
+          const session = cols[17].trim();
+          const oi = parseInt(cols[11].trim(), 10);
+          if (/^\d{4}-\d{2}-\d{2}$/.test(dt) && session === '一般' && !month.includes('/') && !isNaN(oi) && oi > 0) {
+            taifexOiTemp.set(dt, (taifexOiTemp.get(dt) || 0) + oi);
+          }
+        }
+      }
+      taifexOiTemp.forEach((val, dt) => {
+        if (val > 0) totalOiByDate.set(dt, val);
+      });
+    } catch (_) {}
+  }
 
-        // 嘗試從 futDailyMarketReport 抓取最新交易日之微型臺指全部契約未沖銷總量 (全月份合計)
-        let totalOI = REAL_TAIFEX_TMF_BENCHMARK_DATABASE[latestDt]?.totalOI || 96112;
-        try {
-          const reportP = new URLSearchParams();
-          reportP.append('queryDate', latestDt.replace(/-/g, '/'));
-          reportP.append('MarketCode', '0');
-          reportP.append('commodity_id', 'TMF');
+  // 若最新交易日有三大法人留倉但尚未解析到 totalOI，補查當日 futDailyMarketReport（排除價差列）
+  const sortedInstDates = Array.from(instByDate.keys()).sort();
+  if (sortedInstDates.length > 0) {
+    const latestInstDt = sortedInstDates[sortedInstDates.length - 1];
+    if (!totalOiByDate.get(latestInstDt)) {
+      try {
+        const reportP = new URLSearchParams();
+        reportP.append('queryDate', latestInstDt.replace(/-/g, '/'));
+        reportP.append('MarketCode', '0');
+        reportP.append('commodity_id', 'TMF');
 
-          const reportRes: any = await Promise.race([
-            fetch('https://www.taifex.com.tw/cht/3/futDailyMarketReport', {
-              method: 'POST',
-              body: reportP,
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            }),
-            new Promise<any>((_, reject) => setTimeout(() => reject(new Error('TAIFEX report timeout')), 3500)),
-          ]);
+        const reportRes: any = await Promise.race([
+          fetch('https://www.taifex.com.tw/cht/3/futDailyMarketReport', {
+            method: 'POST',
+            body: reportP,
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          }),
+          new Promise<any>((_, reject) => setTimeout(() => reject(new Error('TAIFEX report timeout')), 4000)),
+        ]);
 
-          if (reportRes && reportRes.ok) {
-            const html = await reportRes.text();
-            const rows = html.split(/<tr[^>]*>/i);
-            let parsedOI = 0;
-            for (const r of rows) {
-              if (r.includes('TMF') && r.includes('202')) {
-                const cols = r.split(/<\/td>|<\/TD>/i).map((c: string) => c.replace(/<[^>]*>/g, '').trim());
-                if (cols.length >= 13) {
-                  const oiVal = parseInt(cols[12].replace(/,/g, ''), 10);
-                  if (!isNaN(oiVal) && oiVal > 0) parsedOI += oiVal;
-                }
+        if (reportRes && reportRes.ok) {
+          const html = await reportRes.text();
+          const rows = html.split(/<tr[^>]*>/i);
+          let parsedOI = 0;
+          for (const r of rows) {
+            if (r.includes('TMF') && !r.includes('/')) {
+              const cols = r.split(/<\/td>|<\/TD>/i).map((c: string) => c.replace(/<[^>]*>/g, '').trim());
+              if (cols.length >= 13) {
+                const oiVal = parseInt(cols[12].replace(/,/g, ''), 10);
+                if (!isNaN(oiVal) && oiVal > 0) parsedOI += oiVal;
               }
             }
-            if (parsedOI > 50000) {
-              totalOI = parsedOI;
-            }
           }
-        } catch (_) {}
-
-        // 散戶留倉公式：散戶多單 = 全市場未平倉 - 法人多單；散戶空單 = 全市場未平倉 - 法人空單
-        const retailLong = Math.max(0, totalOI - latestInst.instLong);
-        const retailShort = Math.max(0, totalOI - latestInst.instShort);
-        // 散戶淨部位 = 散戶多單 - 散戶空單 = -法人淨部位
-        const retailNet = -instNet;
-        // 微台散戶多空比 = (散戶淨部位 / 全市場未平倉量) * 100%
-        const retailRatio = totalOI > 0 ? Number(((retailNet / totalOI) * 100).toFixed(2)) : 0;
-
-        // 同步登記歷史序列
-        byDate.forEach((val, dt) => {
-          const dayInstNet = val.instLong - val.instShort;
-          const dayTotalOI = REAL_TAIFEX_TMF_BENCHMARK_DATABASE[dt]?.totalOI || (dt === latestDt ? totalOI : 100000);
-          const dayRetailNet = -dayInstNet;
-          const dayRetailLong = dayTotalOI - val.instLong;
-          const dayRetailShort = dayTotalOI - val.instShort;
-          const dayRetailRatio = Number(((dayRetailNet / dayTotalOI) * 100).toFixed(2));
-          cachedTmfHistoryMap.set(dt, {
-            totalOI: dayTotalOI,
-            instLong: val.instLong,
-            instShort: val.instShort,
-            instNet: dayInstNet,
-            retailLong: dayRetailLong,
-            retailShort: dayRetailShort,
-            retailNet: dayRetailNet,
-            retailRatio: dayRetailRatio,
-          });
-        });
-
-        const result = {
-          date: latestDt,
-          rawDate: latestDt.replace(/-/g, ''),
-          commodityName: '微型臺指期貨 (TMF)',
-          totalOI,
-          institutionalLong: latestInst.instLong,
-          institutionalShort: latestInst.instShort,
-          institutionalNet: instNet,
-          instLong: latestInst.instLong,
-          instShort: latestInst.instShort,
-          instNet,
-          retailLong,
-          retailShort,
-          retailNet,
-          retailRatio,
-          dataSource: '臺灣期貨交易所 (TAIFEX) 官方微型臺指 (TMF) 每日交易統計',
-          isRealData: true,
-        };
-
-        cachedTaifexData = { data: result, timestamp: Date.now() };
-        return result;
-      }
+          if (parsedOI > 10000) {
+            totalOiByDate.set(latestInstDt, parsedOI);
+          }
+        }
+      } catch (_) {}
     }
-  } catch (err: any) {
-    console.warn('TAIFEX direct fetch fallback for TMF:', err?.message || err);
+
+    // 寫入每一筆同時擁有三大法人與全市場未平倉的官方真實數據
+    let latestValidDate = '';
+    for (const dt of sortedInstDates) {
+      const inst = instByDate.get(dt)!;
+      const dayTotalOI = totalOiByDate.get(dt) || REAL_TAIFEX_TMF_BENCHMARK_DATABASE[dt]?.totalOI;
+      if (!dayTotalOI || dayTotalOI <= 0) continue;
+
+      const dayInstNet = inst.instLong - inst.instShort;
+      const dayRetailLong = Math.max(0, dayTotalOI - inst.instLong);
+      const dayRetailShort = Math.max(0, dayTotalOI - inst.instShort);
+      const dayRetailNet = -dayInstNet;
+      const dayRetailRatio = Number(((dayRetailNet / dayTotalOI) * 100).toFixed(2));
+
+      cachedTmfHistoryMap.set(dt, {
+        totalOI: dayTotalOI,
+        instLong: inst.instLong,
+        instShort: inst.instShort,
+        instNet: dayInstNet,
+        retailLong: dayRetailLong,
+        retailShort: dayRetailShort,
+        retailNet: dayRetailNet,
+        retailRatio: dayRetailRatio,
+      });
+      latestValidDate = dt;
+    }
+
+    if (latestValidDate) {
+      const latestRecord = cachedTmfHistoryMap.get(latestValidDate)!;
+      const result = {
+        date: latestValidDate,
+        rawDate: latestValidDate.replace(/-/g, ''),
+        commodityName: '微型臺指期貨 (TMF)',
+        totalOI: latestRecord.totalOI,
+        institutionalLong: latestRecord.instLong,
+        institutionalShort: latestRecord.instShort,
+        institutionalNet: latestRecord.instNet,
+        instLong: latestRecord.instLong,
+        instShort: latestRecord.instShort,
+        instNet: latestRecord.instNet,
+        retailLong: latestRecord.retailLong,
+        retailShort: latestRecord.retailShort,
+        retailNet: latestRecord.retailNet,
+        retailRatio: latestRecord.retailRatio,
+        dataSource: '臺灣期貨交易所 (TAIFEX) 官方微型臺指 (TMF) 每日交易統計',
+        isRealData: true,
+      };
+
+      cachedTaifexData = { data: result, timestamp: Date.now() };
+      return result;
+    }
   }
 
   // 官方已查核最新基準資料備援 (2026-11-09 官方結算真實數據)
@@ -2491,6 +2599,189 @@ async function getLiveTwseKeepRateTrend(forceRefresh = false) {
   return result;
 }
 
+interface DailyInstitutionalMoneyItem {
+  date: string;
+  foreignYi: number;
+  trustYi: number;
+  dealerYi: number;
+  dealerSelfYi: number;
+  dealerHedgingYi: number;
+  totalYi: number;
+}
+
+let cachedTwseInstitutional30d: {
+  items: DailyInstitutionalMoneyItem[];
+  timestamp: number;
+} | null = null;
+
+function parseTwseBfi82uJson(json: any): DailyInstitutionalMoneyItem | null {
+  if (!json || json.stat !== 'OK' || !Array.isArray(json.data) || !json.date) {
+    return null;
+  }
+  const rawDate = String(json.date).replace(/[^0-9]/g, '');
+  if (rawDate.length !== 8) return null;
+  const isoDate = `${rawDate.slice(0, 4)}-${rawDate.slice(4, 6)}-${rawDate.slice(6, 8)}`;
+
+  const parseNum = (v: any) => Number(String(v ?? '0').replace(/,/g, '').trim()) || 0;
+
+  let foreignNet = 0;
+  let trustNet = 0;
+  let dealerSelfNet = 0;
+  let dealerHedgingNet = 0;
+  let totalNet = 0;
+  let hasTotal = false;
+
+  for (const row of json.data) {
+    if (!Array.isArray(row) || row.length < 4) continue;
+    const name = String(row[0] || '').trim();
+    const diff = parseNum(row[3]);
+    if (name.includes('外資及陸資')) {
+      foreignNet = diff;
+    } else if (name === '投信') {
+      trustNet = diff;
+    } else if (name.includes('自行買賣')) {
+      dealerSelfNet = diff;
+    } else if (name.includes('避險')) {
+      dealerHedgingNet = diff;
+    } else if (name === '合計') {
+      totalNet = diff;
+      hasTotal = true;
+    }
+  }
+
+  const dealerNet = dealerSelfNet + dealerHedgingNet;
+  if (!hasTotal) {
+    totalNet = foreignNet + trustNet + dealerNet;
+  }
+
+  const toYi = (n: number) => Number((n / 100000000).toFixed(2));
+  return {
+    date: isoDate,
+    foreignYi: toYi(foreignNet),
+    trustYi: toYi(trustNet),
+    dealerYi: toYi(dealerNet),
+    dealerSelfYi: toYi(dealerSelfNet),
+    dealerHedgingYi: toYi(dealerHedgingNet),
+    totalYi: toYi(totalNet),
+  };
+}
+
+async function getLiveTwseInstitutional30d(forceRefresh: boolean = false): Promise<DailyInstitutionalMoneyItem[]> {
+  const now = Date.now();
+  if (!forceRefresh && cachedTwseInstitutional30d && now - cachedTwseInstitutional30d.timestamp < 900000 && cachedTwseInstitutional30d.items.length > 0) {
+    return cachedTwseInstitutional30d.items;
+  }
+
+  const dayMap = new Map<string, DailyInstitutionalMoneyItem>();
+
+  // 1. 平行抓取 FinMind 官方同期三大法人買賣金額統計表 + TWSE BFI82U 最新交易日官方報表
+  const startD = new Date();
+  startD.setDate(startD.getDate() - 70);
+  const startStr = startD.toISOString().split('T')[0];
+
+  const [finRes, twseLatestRes] = await Promise.all([
+    Promise.race([
+      fetch(`https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockTotalInstitutionalInvestors&start_date=${startStr}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      }).then((r: any) => (r.ok ? r.json() : null)),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 7000)),
+    ]).catch(() => null),
+    Promise.race([
+      fetch('https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json', {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      }).then((r: any) => (r.ok ? r.json() : null)),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+    ]).catch(() => null),
+  ]);
+
+  if (finRes && Array.isArray(finRes.data)) {
+    const rawGrouped = new Map<string, Record<string, number>>();
+    for (const row of finRes.data) {
+      if (!row || !row.date || !row.name) continue;
+      const d = String(row.date).slice(0, 10);
+      if (!rawGrouped.has(d)) rawGrouped.set(d, {});
+      const g = rawGrouped.get(d)!;
+      const net = (Number(row.buy) || 0) - (Number(row.sell) || 0);
+      g[row.name] = net;
+    }
+
+    const toYi = (n: number) => Number((n / 100000000).toFixed(2));
+    for (const [d, g] of rawGrouped.entries()) {
+      const foreignNet = g['Foreign_Investor'] || 0;
+      const trustNet = g['Investment_Trust'] || 0;
+      const dealerSelfNet = g['Dealer_self'] || 0;
+      const dealerHedgingNet = g['Dealer_Hedging'] || 0;
+      const dealerNet = dealerSelfNet + dealerHedgingNet;
+      const totalNet = g['total'] !== undefined ? g['total'] : foreignNet + trustNet + dealerNet;
+
+      dayMap.set(d, {
+        date: d,
+        foreignYi: toYi(foreignNet),
+        trustYi: toYi(trustNet),
+        dealerYi: toYi(dealerNet),
+        dealerSelfYi: toYi(dealerSelfNet),
+        dealerHedgingYi: toYi(dealerHedgingNet),
+        totalYi: toYi(totalNet),
+      });
+    }
+  }
+
+  // Merge latest official TWSE BFI82U record (guaranteed freshest post-market official settlement)
+  const latestTwseItem = parseTwseBfi82uJson(twseLatestRes);
+  if (latestTwseItem) {
+    dayMap.set(latestTwseItem.date, latestTwseItem);
+  }
+
+  // 2. 若不足 30 個交易日，直接回溯向 TWSE BFI82U 補齊真實交易日資料
+  if (dayMap.size < 30) {
+    const candidateDates: string[] = [];
+    const cursor = new Date();
+    for (let i = 0; i < 55 && candidateDates.length < 40; i++) {
+      const dayOfWeek = cursor.getDay();
+      if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+        const y = cursor.getFullYear();
+        const m = String(cursor.getMonth() + 1).padStart(2, '0');
+        const dd = String(cursor.getDate()).padStart(2, '0');
+        const iso = `${y}-${m}-${dd}`;
+        if (!dayMap.has(iso)) {
+          candidateDates.push(`${y}${m}${dd}`);
+        }
+      }
+      cursor.setDate(cursor.getDate() - 1);
+    }
+
+    for (let i = 0; i < candidateDates.length && dayMap.size < 30; i += 6) {
+      const batch = candidateDates.slice(i, i + 6);
+      const batchRes = await Promise.all(
+        batch.map(ymd =>
+          Promise.race([
+            fetch(`https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json&type=day&dayDate=${ymd}`, {
+              headers: { 'User-Agent': 'Mozilla/5.0' },
+            })
+              .then((r: any) => (r.ok ? r.json() : null))
+              .then(parseTwseBfi82uJson),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
+          ]).catch(() => null)
+        )
+      );
+      for (const item of batchRes) {
+        if (item) {
+          dayMap.set(item.date, item);
+        }
+      }
+    }
+  }
+
+  const sorted = Array.from(dayMap.values())
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(-30);
+
+  if (sorted.length > 0) {
+    cachedTwseInstitutional30d = { items: sorted, timestamp: now };
+  }
+  return sorted;
+}
+
 app.get('/api/stocks/twse/margin-maintenance', async (req: Request, res: Response) => {
   try {
     const range = (req.query.range as string) || '1y';
@@ -2509,7 +2800,7 @@ app.get('/api/stocks/twse/margin-maintenance', async (req: Request, res: Respons
     const twoYearsAgo = new Date();
     twoYearsAgo.setFullYear(now.getFullYear() - 2);
 
-    const [chartRes, liveTaifex, twseData, twseKeepRateData, fmtqikMap] = await Promise.all([
+    const [chartRes, liveTaifex, twseData, twseKeepRateData, fmtqikMap, institutional30d] = await Promise.all([
       Promise.race([
         yahooFinance.chart('^TWII', {
           period1: twoYearsAgo.toISOString().split('T')[0],
@@ -2521,6 +2812,7 @@ app.get('/api/stocks/twse/margin-maintenance', async (req: Request, res: Respons
       getLiveTwseMarginData(isRefresh),
       getLiveTwseKeepRateTrend(isRefresh),
       getLiveTwseFmtqik(),
+      getLiveTwseInstitutional30d(isRefresh),
     ]);
 
     const rawQuotes: Array<{
@@ -2724,45 +3016,45 @@ app.get('/api/stocks/twse/margin-maintenance', async (req: Request, res: Respons
       });
     }
 
-    // 錨定：校準全序列至 TAIFEX 官方真實微型臺指期貨 (TMF) 籌碼
-    const lastRaw = fullSeries[fullSeries.length - 1].rawRetailRatio;
-    const targetLiveRatio = liveTaifex.retailRatio; // e.g. 44.50%
-    const calibrationOffset = targetLiveRatio - lastRaw;
-    const baseOI = liveTaifex.totalOI || 110683;
+    // 錨定：全序列直接對應 TAIFEX 官方真實微型臺指期貨 (TMF) 籌碼（不虛擬編造）
+    let lastKnownOfficial = {
+      retailRatio: Number(liveTaifex.retailRatio.toFixed(2)),
+      retailLong: liveTaifex.retailLong,
+      retailShort: liveTaifex.retailShort,
+      retailNet: liveTaifex.retailNet,
+      retailTotalOI: liveTaifex.totalOI,
+    };
 
     fullSeries.forEach((item, idx) => {
       // 優先使用 TAIFEX 官方微型臺指 (TMF) 真實歷史紀錄
       const realHistory = cachedTmfHistoryMap.get(item.date) || REAL_TAIFEX_TMF_BENCHMARK_DATABASE[item.date];
 
       if (realHistory) {
-        item.retailRatio = Number(realHistory.retailRatio.toFixed(1));
-        item.retailLong = realHistory.retailLong;
-        item.retailShort = realHistory.retailShort;
-        item.retailNet = realHistory.retailNet;
-        item.retailTotalOI = realHistory.totalOI;
+        const mapped = {
+          retailRatio: Number(realHistory.retailRatio.toFixed(2)),
+          retailLong: realHistory.retailLong,
+          retailShort: realHistory.retailShort,
+          retailNet: realHistory.retailNet,
+          retailTotalOI: realHistory.totalOI,
+        };
+        item.retailRatio = mapped.retailRatio;
+        item.retailLong = mapped.retailLong;
+        item.retailShort = mapped.retailShort;
+        item.retailNet = mapped.retailNet;
+        item.retailTotalOI = mapped.retailTotalOI;
+        lastKnownOfficial = mapped;
       } else {
-        const weight = 0.5 + 0.5 * (idx / (totalCount - 1));
-        let calibratedRatio = Number((item.rawRetailRatio + calibrationOffset * weight).toFixed(1));
-        if (idx === totalCount - 1) {
-          calibratedRatio = Number(targetLiveRatio.toFixed(1));
-        }
-        calibratedRatio = Math.max(-65, Math.min(65, calibratedRatio));
-
-        const dailyOI = Math.round(baseOI * (0.88 + 0.12 * Math.sin(idx * 0.08)));
-        const netPos = Math.round((calibratedRatio / 100) * dailyOI);
-        const retailLong = Math.round((dailyOI + netPos) / 2);
-        const retailShort = Math.round((dailyOI - netPos) / 2);
-
-        item.retailRatio = calibratedRatio;
-        item.retailLong = retailLong;
-        item.retailShort = retailShort;
-        item.retailNet = netPos;
-        item.retailTotalOI = dailyOI;
+        // 若當日盤中尚未公布或極早期缺漏，沿用最近一筆已公布之官方結算值
+        item.retailRatio = lastKnownOfficial.retailRatio;
+        item.retailLong = lastKnownOfficial.retailLong;
+        item.retailShort = lastKnownOfficial.retailShort;
+        item.retailNet = lastKnownOfficial.retailNet;
+        item.retailTotalOI = lastKnownOfficial.retailTotalOI;
       }
 
-      // 最後一天嚴格等於 TAIFEX 官方即時真實結算
-      if (idx === totalCount - 1) {
-        item.retailRatio = Number(liveTaifex.retailRatio.toFixed(1));
+      // 若最後一天尚未入列歷史表或與 liveTaifex 同日，對齊最新官方結算數據
+      if (idx === totalCount - 1 && (!realHistory || item.date === liveTaifex.date)) {
+        item.retailRatio = Number(liveTaifex.retailRatio.toFixed(2));
         item.retailLong = liveTaifex.retailLong;
         item.retailShort = liveTaifex.retailShort;
         item.retailNet = liveTaifex.retailNet;
@@ -2788,7 +3080,7 @@ app.get('/api/stocks/twse/margin-maintenance', async (req: Request, res: Respons
     const prevMaintenanceRatio = prev ? prev.marginMaintenanceRatio : latestMaintenanceRatio;
 
     const ratioChange = Number((latestMaintenanceRatio - prevMaintenanceRatio).toFixed(2));
-    const retailRatioChange = Number((latest.retailRatio - prev.retailRatio).toFixed(1));
+    const retailRatioChange = Number((latest.retailRatio - prev.retailRatio).toFixed(2));
 
     // 4. 評定維持率狀態
     let riskTitle = '';
@@ -2825,8 +3117,9 @@ app.get('/api/stocks/twse/margin-maintenance', async (req: Request, res: Respons
 
     if (latest.retailRatio > 20) {
       retailSignal = 'EXTREME_BULLISH';
-      retailSignalLabel = '⚠️ 微台散戶偏多 · 多方大減獲利平倉';
-      retailSignalDesc = `微型臺指期貨 (TMF) 散戶多空比為 +${latest.retailRatio}%，散戶淨多單為 +${latest.retailNet.toLocaleString()} 口（總OI ${latest.retailTotalOI.toLocaleString()} 口）。隨大盤強彈近兩千點，散戶多單單日劇減 -${Math.abs(retailRatioChange)}%，外資空單大幅回補，籌碼結構轉向良性沉澱。`;
+      retailSignalLabel = retailRatioChange >= 0 ? '⚠️ 微台散戶高度偏多 · 淨多持續增加' : '⚠️ 微台散戶偏多 · 淨多單獲利調節';
+      const deltaDesc = retailRatioChange >= 0 ? `單日增加 +${retailRatioChange}%` : `單日減少 ${retailRatioChange}%`;
+      retailSignalDesc = `微型臺指期貨 (TMF) 散戶多空比為 +${latest.retailRatio}%，散戶淨多單為 +${latest.retailNet.toLocaleString()} 口（總OI ${latest.retailTotalOI.toLocaleString()} 口），${deltaDesc}，法人淨部位與散戶呈現明顯對作。`;
       retailSignalBadgeColor = 'amber';
     } else if (latest.retailRatio > 5) {
       retailSignal = 'BULLISH';
@@ -2918,6 +3211,7 @@ app.get('/api/stocks/twse/margin-maintenance', async (req: Request, res: Respons
         cashRedeemYi: twseData.cashRedeemYi,
       },
       series: displaySeries,
+      institutional30d,
     };
 
     cachedMarginMaintenanceMap.set(cacheKey, {

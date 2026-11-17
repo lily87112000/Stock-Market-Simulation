@@ -311,6 +311,16 @@ export interface DailyMarketMarginPoint {
   retailTotalOI: number; // 小台全市場未平倉總量 (口)
 }
 
+export interface DailyMarketInstitutionalMoney {
+  date: string; // YYYY-MM-DD
+  foreignYi: number; // 外資買賣超 (億元)
+  trustYi: number; // 投信買賣超 (億元)
+  dealerYi: number; // 自營商合計買賣超 (億元)
+  dealerSelfYi: number; // 自營商(自行買賣) (億元)
+  dealerHedgingYi: number; // 自營商(避險) (億元)
+  totalYi: number; // 三大法人合計買賣超 (億元)
+}
+
 export interface MarketMarginSummary {
   latestDate: string;
   currentTaiex: number;
@@ -359,6 +369,7 @@ export interface MarketMarginSummary {
     cashRedeemYi: number;
   };
   series: DailyMarketMarginPoint[];
+  institutional30d?: DailyMarketInstitutionalMoney[];
 }
 
 export interface InstitutionalDailyRecord {

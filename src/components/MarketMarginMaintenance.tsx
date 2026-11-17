@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { MarketMarginSummary, DailyMarketMarginPoint } from '../types/stock.ts';
+import { MarketMarginSummary, DailyMarketMarginPoint, DailyMarketInstitutionalMoney } from '../types/stock.ts';
 import { fetchMarketMarginMaintenance } from '../services/api.ts';
 import {
   TrendingUp,
@@ -10,16 +10,10 @@ import {
   Activity,
   Layers,
   Calendar,
-  Zap,
   Users,
-  Compass,
-  ArrowUpRight,
-  ArrowDownRight,
-  BarChart2,
-  ChevronDown,
-  ChevronUp,
   ArrowDown,
   ArrowUp,
+  BarChart3,
 } from 'lucide-react';
 
 interface MarketMarginMaintenanceProps {
@@ -27,6 +21,14 @@ interface MarketMarginMaintenanceProps {
 }
 
 type TimeRange = '1mo' | '3mo' | '6mo' | '1y' | '2y';
+type InstParty = 'total' | 'foreign' | 'trust' | 'dealer';
+type PartyKey = 'foreign' | 'trust' | 'dealer';
+
+const PARTY_COLORS: Record<PartyKey, { label: string; color: string }> = {
+  foreign: { label: '外資', color: '#3b82f6' },
+  trust: { label: '投信', color: '#f97316' },
+  dealer: { label: '自營商', color: '#a855f7' },
+};
 
 export const MarketMarginMaintenance: React.FC<MarketMarginMaintenanceProps> = () => {
   const [data, setData] = useState<MarketMarginSummary | null>(null);
@@ -39,9 +41,6 @@ export const MarketMarginMaintenance: React.FC<MarketMarginMaintenanceProps> = (
   const marginSectionRef = useRef<HTMLDivElement>(null);
   const retailSectionRef = useRef<HTMLDivElement>(null);
 
-  // Mobile collapsible state for trader playbook guide
-  const [isTraderGuideOpen, setIsTraderGuideOpen] = useState<boolean>(false);
-
   // Hover / Touch tracking for interactive crosshair on margin maintenance chart
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
   const chartSvgRef = useRef<SVGSVGElement>(null);
@@ -49,6 +48,11 @@ export const MarketMarginMaintenance: React.FC<MarketMarginMaintenanceProps> = (
   // Hover / Touch tracking for interactive crosshair on retail sentiment chart
   const [activeRetailIndex, setActiveRetailIndex] = useState<number | null>(null);
   const retailChartSvgRef = useRef<SVGSVGElement>(null);
+
+  // 30-day Institutional Net Buy/Sell Stacked Bar Chart controls
+  const [instParty, setInstParty] = useState<InstParty>('total');
+  const [activeInstDate, setActiveInstDate] = useState<string | null>(null);
+  const instBarSvgRef = useRef<SVGSVGElement>(null);
 
   const loadData = useCallback(async (range: TimeRange, forceRefresh: boolean = false) => {
     try {
@@ -159,6 +163,59 @@ export const MarketMarginMaintenance: React.FC<MarketMarginMaintenanceProps> = (
       maxTaiex,
     };
   }, [data]);
+
+  const institutional30d = data?.institutional30d || [];
+
+  const instSummary = useMemo(() => {
+    if (institutional30d.length === 0) return null;
+    const sum = institutional30d.reduce(
+      (acc, d) => {
+        acc.foreign += d.foreignYi;
+        acc.trust += d.trustYi;
+        acc.dealer += d.dealerYi;
+        acc.total += d.totalYi;
+        return acc;
+      },
+      { foreign: 0, trust: 0, dealer: 0, total: 0 }
+    );
+    return {
+      foreign: Number(sum.foreign.toFixed(2)),
+      trust: Number(sum.trust.toFixed(2)),
+      dealer: Number(sum.dealer.toFixed(2)),
+      total: Number(sum.total.toFixed(2)),
+      days: institutional30d.length,
+    };
+  }, [institutional30d]);
+
+  const getInstPartyVal = useCallback((d: DailyMarketInstitutionalMoney, party: InstParty) => {
+    if (party === 'foreign') return d.foreignYi;
+    if (party === 'trust') return d.trustYi;
+    if (party === 'dealer') return d.dealerYi;
+    return d.totalYi;
+  }, []);
+
+  const activeInstPoint: DailyMarketInstitutionalMoney | null = useMemo(() => {
+    if (institutional30d.length === 0) return null;
+    if (activeInstDate) {
+      const found = institutional30d.find((d) => d.date === activeInstDate);
+      if (found) return found;
+    }
+    return institutional30d[institutional30d.length - 1];
+  }, [institutional30d, activeInstDate]);
+
+  const handleInstBarPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (!instBarSvgRef.current || institutional30d.length === 0) return;
+    const rect = instBarSvgRef.current.getBoundingClientRect();
+    if (!rect.width) return;
+    const svgX = ((e.clientX - rect.left) / rect.width) * 900;
+    const pLeft = 52;
+    const pRight = 16;
+    const plotW = 900 - pLeft - pRight;
+    const ratio = Math.max(0, Math.min(1, (svgX - pLeft) / plotW));
+    const idx = Math.round(ratio * (institutional30d.length - 1));
+    const clamped = Math.max(0, Math.min(institutional30d.length - 1, idx));
+    setActiveInstDate(institutional30d[clamped].date);
+  };
 
   // Pointer tracking for Margin chart (optimized for mobile touch scrubbing)
   const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -358,89 +415,37 @@ export const MarketMarginMaintenance: React.FC<MarketMarginMaintenanceProps> = (
         )}
       </div>
 
-      {/* 2. Maintenance Ratio Level & Thermometer Visual Banner */}
-      {data && (
+      {/* 2. 臺灣證券交易所 (TWSE BFIJ3U) 官方真實信用違約與處分統計 */}
+      {data && data.officialTwseDetails && (
         <div className="bg-slate-900/90 border border-slate-800 rounded-xl sm:rounded-2xl p-2.5 sm:p-4 shadow-lg">
-          <div className="flex items-center justify-between gap-2 mb-1.5">
-            <h2 className="text-[11px] sm:text-xs font-bold text-slate-200 flex items-center gap-1.5">
-              <Zap size={13} className="text-amber-400" />
-              <span>大盤融資維持率水位刻度</span>
-            </h2>
-            <span className="text-[10px] sm:text-[11px] text-slate-400 font-mono">
-              當前：<strong className="text-slate-100 font-bold">{data.currentMaintenanceRatio.toFixed(2)}%</strong>
-            </span>
-          </div>
-
-          {/* Color bar thermometer */}
-          <div className="relative pt-5 pb-1">
-            {/* Pointer Pin indicator */}
-            {(() => {
-              const clampedRatio = Math.max(120, Math.min(180, data.currentMaintenanceRatio));
-              const leftPct = ((clampedRatio - 120) / (180 - 120)) * 100;
-              return (
-                <div
-                  className="absolute top-0 -translate-x-1/2 flex flex-col items-center transition-all duration-500 z-10"
-                  style={{ left: `${leftPct}%` }}
-                >
-                  <span className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] font-black font-mono bg-white text-slate-950 shadow-md whitespace-nowrap">
-                    {data.currentMaintenanceRatio.toFixed(2)}%
-                  </span>
-                  <div className="w-0 h-0 border-x-3.5 border-x-transparent border-t-3.5 border-t-white" />
-                </div>
-              );
-            })()}
-
-            {/* Segmented Risk Bar */}
-            <div className="h-2.5 sm:h-3 w-full rounded-full overflow-hidden flex bg-slate-950 border border-slate-800 shadow-inner">
-              <div className="h-full bg-linear-to-r from-red-600 to-rose-600" style={{ width: '16.7%' }} title="< 130% 斷頭多殺多風暴區" />
-              <div className="h-full bg-linear-to-r from-rose-500 to-amber-500" style={{ width: '16.7%' }} title="130% ~ 140% 融資追繳警戒區" />
-              <div className="h-full bg-linear-to-r from-amber-500 to-blue-500" style={{ width: '33.3%' }} title="140% ~ 160% 降槓桿健康整理區" />
-              <div className="h-full bg-linear-to-r from-blue-500 to-emerald-500" style={{ width: '16.7%' }} title="160% ~ 170% 強勢多頭推升區" />
-              <div className="h-full bg-linear-to-r from-emerald-500 to-purple-600" style={{ width: '16.6%' }} title="> 170% 融資過熱超買警戒區" />
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+            <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2 flex flex-col">
+              <span className="text-slate-400 text-[10px]">低於130%警戒戶數</span>
+              <span className="text-amber-400 font-bold text-xs sm:text-sm mt-0.5">
+                {data.officialTwseDetails.belowAccNum.toLocaleString()} 戶
+              </span>
             </div>
-
-            {/* Ticks and Zone Labels */}
-            <div className="flex justify-between text-[9px] sm:text-[10px] text-slate-400 mt-1 font-mono px-0.5">
-              <span className="text-rose-400 font-bold">120% 斷頭</span>
-              <span className="text-amber-400 font-bold">130%</span>
-              <span className="text-amber-300">140% 追繳</span>
-              <span className="text-blue-400">160% 基準</span>
-              <span className="text-purple-400 font-bold">170% 過熱</span>
-              <span className="text-slate-400">180%+</span>
+            <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2 flex flex-col">
+              <span className="text-slate-400 text-[10px]">融資追繳戶數 (金額)</span>
+              <span className="text-amber-300 font-bold text-xs sm:text-sm mt-0.5">
+                {data.officialTwseDetails.callAccNum.toLocaleString()} 戶
+                <span className="text-[10px] text-slate-400 font-normal ml-1">({data.officialTwseDetails.callAmtYi}億)</span>
+              </span>
+            </div>
+            <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2 flex flex-col">
+              <span className="text-slate-400 text-[10px]">斷頭強制處分戶數</span>
+              <span className="text-rose-400 font-bold text-xs sm:text-sm mt-0.5">
+                {data.officialTwseDetails.exeAccNum.toLocaleString()} 戶
+                <span className="text-[10px] text-slate-400 font-normal ml-1">({data.officialTwseDetails.exeAmtYi}億)</span>
+              </span>
+            </div>
+            <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2 flex flex-col">
+              <span className="text-slate-400 text-[10px]">信用成交總金額</span>
+              <span className="text-blue-300 font-bold text-xs sm:text-sm mt-0.5">
+                {data.officialTwseDetails.crdAmtYi.toLocaleString()} 億元
+              </span>
             </div>
           </div>
-
-          {/* 臺灣證券交易所 (TWSE BFIJ3U) 官方真實信用違約與處分統計 */}
-          {data.officialTwseDetails && (
-            <div className="mt-3 pt-2.5 border-t border-slate-800/80 grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
-              <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2 flex flex-col">
-                <span className="text-slate-400 text-[10px]">低於130%警戒戶數</span>
-                <span className="text-amber-400 font-bold text-xs sm:text-sm mt-0.5">
-                  {data.officialTwseDetails.belowAccNum.toLocaleString()} 戶
-                </span>
-              </div>
-              <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2 flex flex-col">
-                <span className="text-slate-400 text-[10px]">融資追繳戶數 (金額)</span>
-                <span className="text-amber-300 font-bold text-xs sm:text-sm mt-0.5">
-                  {data.officialTwseDetails.callAccNum.toLocaleString()} 戶
-                  <span className="text-[10px] text-slate-400 font-normal ml-1">({data.officialTwseDetails.callAmtYi}億)</span>
-                </span>
-              </div>
-              <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2 flex flex-col">
-                <span className="text-slate-400 text-[10px]">斷頭強制處分戶數</span>
-                <span className="text-rose-400 font-bold text-xs sm:text-sm mt-0.5">
-                  {data.officialTwseDetails.exeAccNum.toLocaleString()} 戶
-                  <span className="text-[10px] text-slate-400 font-normal ml-1">({data.officialTwseDetails.exeAmtYi}億)</span>
-                </span>
-              </div>
-              <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2 flex flex-col">
-                <span className="text-slate-400 text-[10px]">信用成交總金額</span>
-                <span className="text-blue-300 font-bold text-xs sm:text-sm mt-0.5">
-                  {data.officialTwseDetails.crdAmtYi.toLocaleString()} 億元
-                </span>
-              </div>
-            </div>
-          )}
         </div>
       )}
 
@@ -880,26 +885,6 @@ export const MarketMarginMaintenance: React.FC<MarketMarginMaintenanceProps> = (
               <ArrowUp size={11} />
             </button>
           </div>
-
-          {/* Trader Signal Badge */}
-          {data && (
-            <div className="flex items-center gap-2 self-start sm:self-auto">
-              <span className={`px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-md text-[10px] sm:text-xs font-bold border flex items-center gap-1 ${
-                data.retailSignal === 'EXTREME_BULLISH'
-                  ? 'bg-rose-500/20 text-rose-300 border-rose-500/40 animate-pulse'
-                  : data.retailSignal === 'BULLISH'
-                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
-                  : data.retailSignal === 'BEARISH'
-                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                  : data.retailSignal === 'EXTREME_BEARISH'
-                  ? 'bg-emerald-600/30 text-emerald-200 border-emerald-400 animate-pulse'
-                  : 'bg-blue-500/20 text-blue-300 border-blue-500/40'
-              }`}>
-                <Compass size={12} />
-                <span>{data.retailSignalLabel}</span>
-              </span>
-            </div>
-          )}
         </div>
 
         {/* Legend: Horizontal scrollable strip on mobile */}
@@ -1254,59 +1239,351 @@ export const MarketMarginMaintenance: React.FC<MarketMarginMaintenanceProps> = (
             </div>
           ) : null}
         </div>
+      </div>
 
-        {/* 頂級操盤手微台 (TMF) 散戶多空比實戰解碼指南 (Mobile Collapsible Accordion) */}
-        <div className="bg-slate-950/70 border border-slate-800 rounded-lg p-2 sm:p-3 mt-0.5">
-          <button
-            onClick={() => setIsTraderGuideOpen(prev => !prev)}
-            className="w-full flex items-center justify-between text-[11px] sm:text-xs font-bold text-slate-200 cursor-pointer"
-          >
-            <div className="flex items-center gap-1.5">
-              <Compass size={13} className="text-purple-400" />
-              <span>操盤手微台籌碼實戰操作指引 · 反指標解碼</span>
-            </div>
-            <div className="flex items-center gap-1 text-[10px] text-slate-400">
-              <span className="sm:hidden">{isTraderGuideOpen ? '收合' : '點擊展開'}</span>
-              {isTraderGuideOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-            </div>
-          </button>
-
-          {/* Collapsible Content */}
-          <div className={`${isTraderGuideOpen ? 'block' : 'hidden sm:block'} mt-2 pt-2 border-t border-slate-800/80`}>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs leading-relaxed">
-              <div className="bg-slate-900/80 border border-emerald-500/30 rounded-lg p-2 sm:p-2.5">
-                <span className="font-bold text-emerald-400 flex items-center gap-1 text-[11px]">
-                  <ArrowUpRight size={12} />
-                  <span>① 主力強勢軋空 (微台多空比 &lt; -20%)</span>
-                </span>
-                <p className="text-slate-300 text-[10px] sm:text-[11px] mt-1">
-                  微台散戶多空比跌破 <strong>-20% 以下</strong>，代表自然人散戶沿路摸頂放空被套。微台保證金低、自然人參與度最高，只要微台散戶不停損、多空比未由負翻正，主力便會維持強勢軋空噴出，切忌盲目摸頂！
-                </p>
+      {/* 5. 大盤最新 30 天三大法人買賣超金額 (同日堆疊柱狀圖) */}
+      {institutional30d.length > 0 && instSummary && (
+        <div className="bg-slate-900 border border-slate-800 rounded-xl sm:rounded-2xl p-2.5 sm:p-4 shadow-xl flex flex-col gap-2 sm:gap-2.5">
+          {/* Header & Party Filter */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800/60 pb-2">
+            <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-amber-500/20 text-amber-400 border border-amber-500/30 flex items-center justify-center shrink-0">
+                <BarChart3 size={15} />
               </div>
+              <h3 className="text-xs sm:text-sm lg:text-base font-extrabold text-slate-100 tracking-tight">
+                大盤最新{instSummary.days}天三大法人買賣超金額
+              </h3>
+              <span className="text-[9px] sm:text-[10px] px-1.5 py-0.2 rounded-full font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                TWSE BFI82U 官方 (億元)
+              </span>
+            </div>
 
-              <div className="bg-slate-900/80 border border-rose-500/30 rounded-lg p-2 sm:p-2.5">
-                <span className="font-bold text-rose-400 flex items-center gap-1 text-[11px]">
-                  <ArrowDownRight size={12} />
-                  <span>② 主力誘多殺多 (微台多空比 &gt; +20%)</span>
-                </span>
-                <p className="text-slate-300 text-[10px] sm:text-[11px] mt-1">
-                  指數遇阻回檔，微台散戶多空比卻逆勢飆破 <strong>+20%</strong>，代表散戶逢回盲目接刀。此時主力法人反手調節，極易摜破支撐進行「誘多殺多雙斷頭」，切忌盲目開高槓桿攤平！
-                </p>
-              </div>
-
-              <div className="bg-slate-900/80 border border-blue-500/30 rounded-lg p-2 sm:p-2.5">
-                <span className="font-bold text-blue-400 flex items-center gap-1 text-[11px]">
-                  <BarChart2 size={12} />
-                  <span>③ 微台反向背離轉折預警</span>
-                </span>
-                <p className="text-slate-300 text-[10px] sm:text-[11px] mt-1">
-                  微台已取代小台成為散戶資金最集中的溫度計。若指數創波段新高，但<strong>微台散戶多空比由負轉正急速攀升</strong>（散戶亢奮追多），常為主力高檔調節警訊；反之，若指數破底但散戶比轉負收斂，常為波段黃金大底先兆！
-                </p>
+            <div className="flex items-center justify-end gap-2 flex-wrap">
+              {/* Institution Party Filter */}
+              <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 shadow-inner">
+                {(
+                  [
+                    { key: 'total', label: '三大法人' },
+                    { key: 'foreign', label: '外資' },
+                    { key: 'trust', label: '投信' },
+                    { key: 'dealer', label: '自營商' },
+                  ] as Array<{ key: InstParty; label: string }>
+                ).map((tab) => (
+                  <button
+                    key={tab.key}
+                    onClick={() => setInstParty(tab.key)}
+                    className={`px-2 py-0.5 sm:py-1 text-[10px] sm:text-xs rounded-md font-semibold transition-all cursor-pointer ${
+                      instParty === tab.key
+                        ? tab.key === 'foreign'
+                          ? 'bg-blue-600 text-white shadow-xs'
+                          : tab.key === 'trust'
+                          ? 'bg-orange-600 text-white shadow-xs'
+                          : tab.key === 'dealer'
+                          ? 'bg-purple-600 text-white shadow-xs'
+                          : 'bg-blue-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
               </div>
             </div>
           </div>
+
+          {/* Color Legend Strip: 藍=外資 / 橘=投信 / 紫=自營 */}
+          <div className="flex items-center gap-3 sm:gap-4 text-[10px] sm:text-xs overflow-x-auto no-scrollbar bg-slate-950/70 border border-slate-800/80 px-2.5 py-1 sm:py-1.5 rounded-lg whitespace-nowrap">
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="w-2.5 h-2.5 rounded-xs bg-blue-500 inline-block" />
+              <span className="text-blue-300 font-semibold">外資 (藍色)</span>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="w-2.5 h-2.5 rounded-xs bg-orange-500 inline-block" />
+              <span className="text-orange-300 font-semibold">投信 (橘色)</span>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="w-2.5 h-2.5 rounded-xs bg-purple-500 inline-block" />
+              <span className="text-purple-300 font-semibold">自營商 (紫色)</span>
+            </div>
+            <div className="flex items-center gap-2 text-slate-400 shrink-0 ml-auto text-[10px]">
+              <span>0軸以上(+)買超 / 以下(-)賣超</span>
+            </div>
+          </div>
+
+          {/* 30-Day Cumulative Summary Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+            <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2 flex flex-col">
+              <span className="text-slate-400 text-[10px]">{instSummary.days}日合計累計</span>
+              <span className={`font-bold text-xs sm:text-sm mt-0.5 ${instSummary.total >= 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                {instSummary.total >= 0 ? `+${instSummary.total.toLocaleString()}` : instSummary.total.toLocaleString()} 億
+              </span>
+            </div>
+            <div className="bg-slate-950/70 border border-blue-500/30 rounded-lg p-2 flex flex-col">
+              <span className="text-blue-300 text-[10px] flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-500 inline-block" />
+                <span>{instSummary.days}日外資累計</span>
+              </span>
+              <span className={`font-bold text-xs sm:text-sm mt-0.5 ${instSummary.foreign >= 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                {instSummary.foreign >= 0 ? `+${instSummary.foreign.toLocaleString()}` : instSummary.foreign.toLocaleString()} 億
+              </span>
+            </div>
+            <div className="bg-slate-950/70 border border-orange-500/30 rounded-lg p-2 flex flex-col">
+              <span className="text-orange-300 text-[10px] flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-orange-500 inline-block" />
+                <span>{instSummary.days}日投信累計</span>
+              </span>
+              <span className={`font-bold text-xs sm:text-sm mt-0.5 ${instSummary.trust >= 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                {instSummary.trust >= 0 ? `+${instSummary.trust.toLocaleString()}` : instSummary.trust.toLocaleString()} 億
+              </span>
+            </div>
+            <div className="bg-slate-950/70 border border-purple-500/30 rounded-lg p-2 flex flex-col">
+              <span className="text-purple-300 text-[10px] flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-purple-500 inline-block" />
+                <span>{instSummary.days}日自營商累計</span>
+              </span>
+              <span className={`font-bold text-xs sm:text-sm mt-0.5 ${instSummary.dealer >= 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                {instSummary.dealer >= 0 ? `+${instSummary.dealer.toLocaleString()}` : instSummary.dealer.toLocaleString()} 億
+              </span>
+            </div>
+          </div>
+
+          {/* Active Date HUD */}
+          {activeInstPoint && (
+            <div className="bg-slate-950 border border-slate-800/90 rounded-lg px-2.5 py-1.5 flex items-center justify-between gap-1.5 flex-wrap text-[11px] sm:text-xs shadow-xs">
+              <div className="flex items-center gap-1 text-slate-300 shrink-0">
+                <Calendar size={11} className="text-slate-400" />
+                <span className="font-mono font-bold text-slate-200">{activeInstPoint.date}</span>
+              </div>
+              <div className="flex items-center gap-2 sm:gap-4 flex-wrap font-mono">
+                <div>
+                  <span className="text-slate-400 mr-1 font-sans">合計:</span>
+                  <span className={`font-bold ${activeInstPoint.totalYi >= 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                    {activeInstPoint.totalYi >= 0 ? `+${activeInstPoint.totalYi}` : activeInstPoint.totalYi}億
+                  </span>
+                </div>
+                <div>
+                  <span className="text-blue-400 mr-1 font-sans">外資:</span>
+                  <span className={`font-bold ${activeInstPoint.foreignYi >= 0 ? 'text-blue-300' : 'text-blue-400/80'}`}>
+                    {activeInstPoint.foreignYi >= 0 ? `+${activeInstPoint.foreignYi}` : activeInstPoint.foreignYi}億
+                  </span>
+                </div>
+                <div>
+                  <span className="text-orange-400 mr-1 font-sans">投信:</span>
+                  <span className={`font-bold ${activeInstPoint.trustYi >= 0 ? 'text-orange-300' : 'text-orange-400/80'}`}>
+                    {activeInstPoint.trustYi >= 0 ? `+${activeInstPoint.trustYi}` : activeInstPoint.trustYi}億
+                  </span>
+                </div>
+                <div>
+                  <span className="text-purple-400 mr-1 font-sans">自營:</span>
+                  <span className={`font-bold ${activeInstPoint.dealerYi >= 0 ? 'text-purple-300' : 'text-purple-400/80'}`}>
+                    {activeInstPoint.dealerYi >= 0 ? `+${activeInstPoint.dealerYi}` : activeInstPoint.dealerYi}億
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Stacked Bar Chart Visualization */}
+          <div className="relative w-full overflow-hidden bg-slate-950/80 border border-slate-800/80 rounded-lg p-1 select-none">
+            <svg
+              ref={instBarSvgRef}
+              viewBox="0 0 900 300"
+              className="w-full h-60 sm:h-76 lg:h-88 touch-none select-none cursor-crosshair"
+              onPointerDown={(e) => {
+                try {
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                } catch (_) {}
+                handleInstBarPointerMove(e);
+              }}
+              onPointerMove={handleInstBarPointerMove}
+              onPointerUp={(e) => {
+                try {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                } catch (_) {}
+              }}
+              onPointerLeave={() => setActiveInstDate(null)}
+              onPointerCancel={() => setActiveInstDate(null)}
+            >
+              {(() => {
+                const count = institutional30d.length;
+                const pLeft = 52;
+                const pRight = 16;
+                const pTop = 18;
+                const pBottom = 26;
+                const plotW = 900 - pLeft - pRight;
+                const plotH = 300 - pTop - pBottom;
+
+                const maxAbs = Math.max(
+                  50,
+                  Math.ceil(
+                    Math.max(
+                      ...institutional30d.map((d) => {
+                        if (instParty === 'total') {
+                          const posSum =
+                            Math.max(0, d.foreignYi) +
+                            Math.max(0, d.trustYi) +
+                            Math.max(0, d.dealerYi);
+                          const negSum = Math.abs(
+                            Math.min(0, d.foreignYi) +
+                              Math.min(0, d.trustYi) +
+                              Math.min(0, d.dealerYi)
+                          );
+                          return Math.max(posSum, negSum);
+                        }
+                        return Math.abs(getInstPartyVal(d, instParty));
+                      })
+                    ) / 50
+                  ) * 50
+                );
+                const y0 = pTop + plotH / 2;
+                const stepW = plotW / count;
+                const toY = (v: number) => y0 - (v / maxAbs) * (plotH / 2);
+
+                const gridVals = [maxAbs, maxAbs / 2, 0, -maxAbs / 2, -maxAbs];
+                const xLabelIdxs = [0, Math.floor(count * 0.25), Math.floor(count * 0.5), Math.floor(count * 0.75), count - 1];
+
+                const singleColor =
+                  instParty === 'foreign'
+                    ? PARTY_COLORS.foreign.color
+                    : instParty === 'trust'
+                    ? PARTY_COLORS.trust.color
+                    : PARTY_COLORS.dealer.color;
+
+                  return (
+                    <g>
+                      {gridVals.map((gv, gi) => {
+                        const gy = toY(gv);
+                        return (
+                          <g key={gi}>
+                            <line
+                              x1={pLeft}
+                              y1={gy}
+                              x2={pLeft + plotW}
+                              y2={gy}
+                              stroke={gv === 0 ? '#475569' : '#1e293b'}
+                              strokeWidth={gv === 0 ? '1.4' : '1'}
+                              strokeDasharray={gv === 0 ? 'none' : '4 4'}
+                            />
+                            <text
+                              x={pLeft - 6}
+                              y={gy + 3}
+                              textAnchor="end"
+                              fill={gv > 0 ? '#cbd5e1' : gv < 0 ? '#94a3b8' : '#e2e8f0'}
+                              fontSize="8.5"
+                              fontWeight="bold"
+                              fontFamily="monospace"
+                            >
+                              {gv > 0 ? `+${Math.round(gv)}` : Math.round(gv)}
+                            </text>
+                          </g>
+                        );
+                      })}
+
+                      {institutional30d.map((item, idx) => {
+                        const groupX = pLeft + idx * stepW;
+                        const isActive = activeInstPoint?.date === item.date;
+                        const barW = Math.max(6, stepW * 0.72);
+                        const bx = groupX + (stepW - barW) / 2;
+
+                        if (instParty === 'total') {
+                          const parties = [
+                            { v: item.foreignYi, color: PARTY_COLORS.foreign.color },
+                            { v: item.trustYi, color: PARTY_COLORS.trust.color },
+                            { v: item.dealerYi, color: PARTY_COLORS.dealer.color },
+                          ];
+                          let posCursor = 0;
+                          let negCursor = 0;
+
+                          return (
+                            <g key={item.date}>
+                              {isActive && (
+                                <rect
+                                  x={groupX + 1}
+                                  y={pTop}
+                                  width={stepW - 2}
+                                  height={plotH}
+                                  fill="#ffffff"
+                                  fillOpacity="0.06"
+                                  rx="2"
+                                />
+                              )}
+                              {parties.map((b, bi) => {
+                                if (b.v === 0) return null;
+                                let barY = y0;
+                                let barH = 0;
+                                if (b.v > 0) {
+                                  const yTop = toY(posCursor + b.v);
+                                  const yBot = toY(posCursor);
+                                  barY = yTop;
+                                  barH = Math.max(1.5, yBot - yTop);
+                                  posCursor += b.v;
+                                } else {
+                                  const yTop = toY(negCursor);
+                                  const yBot = toY(negCursor + b.v);
+                                  barY = yTop;
+                                  barH = Math.max(1.5, yBot - yTop);
+                                  negCursor += b.v;
+                                }
+                                return (
+                                  <rect
+                                    key={bi}
+                                    x={bx}
+                                    y={barY}
+                                    width={barW}
+                                    height={barH}
+                                    rx="1.5"
+                                    fill={b.color}
+                                    fillOpacity={isActive ? 1 : 0.88}
+                                    stroke={isActive ? '#ffffff' : '#020617'}
+                                    strokeWidth={isActive ? '1' : '0.6'}
+                                  />
+                                );
+                              })}
+                            </g>
+                          );
+                        }
+
+                        const v = getInstPartyVal(item, instParty);
+                        const yVal = toY(v);
+                        const barY = v >= 0 ? yVal : y0;
+                        const barH = Math.max(2, Math.abs(yVal - y0));
+
+                        return (
+                          <rect
+                            key={item.date}
+                            x={bx}
+                            y={barY}
+                            width={barW}
+                            height={barH}
+                            rx="2"
+                            fill={singleColor}
+                            fillOpacity={isActive ? 1 : 0.85}
+                            stroke={isActive ? '#ffffff' : 'none'}
+                            strokeWidth={isActive ? '1.5' : '0'}
+                          />
+                        );
+                      })}
+
+                      {xLabelIdxs.map((idx, i) => (
+                        <text
+                          key={i}
+                          x={pLeft + idx * stepW + stepW / 2}
+                          y={pTop + plotH + 16}
+                          textAnchor={i === 0 ? 'start' : i === xLabelIdxs.length - 1 ? 'end' : 'middle'}
+                          fill="#64748b"
+                          fontSize="8.5"
+                          fontFamily="monospace"
+                        >
+                          {institutional30d[idx].date.slice(5)}
+                        </text>
+                      ))}
+                    </g>
+                  );
+                })()}
+              </svg>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };
